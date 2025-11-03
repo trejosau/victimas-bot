@@ -12,6 +12,9 @@ export const CONFIG = {
     // ====== Auth (selfbot) ======
     TOKEN: process.env.TOKEN || '',
 
+    // ====== GUILD objetivo ======
+    GUILD_ID: process.env.GUILD_ID || '',   // 👈 NUEVO
+
     // ====== BLOQUE 1: VÍCTIMAS (trades / crosstrade) ======
     MONITOR_CATEGORY_ID: process.env.MONITOR_CATEGORY_ID || '',
     MONITOR_CHANNEL_IDS: csv('MONITOR_CHANNEL_IDS'),

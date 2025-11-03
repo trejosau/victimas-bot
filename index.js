@@ -11,6 +11,8 @@ import { CONFIG as config } from './config.js';
 
 const client = new Client();
 
+const TARGET_GUILD_ID = config.GUILD_ID || '1376127147847979050';
+
 // ====== ROLES JERARQUÍA (orden de mayor a menor) ======
 const ROLE_HIERARCHY = [
     { id: '1432128766347313192', key: 'owner', label: 'Owner' },
@@ -1216,6 +1218,8 @@ client.on('messageCreate', async (message) => {
         if (!message.guild || message.author?.bot) return;
         if (message.author?.id === client.user?.id) return;
 
+        if (message.guild.id !== TARGET_GUILD_ID) return;
+
         if (message.partial && message.fetch) {
             await message.fetch().catch(() => {});
         }
@@ -1234,12 +1238,16 @@ client.on('messageCreate', async (message) => {
     }
 });
 
+
 // Edits (global) -> transcript (solo tickets) + webhook de modificados
 client.on('messageUpdate', async (oldMessage, newMessage) => {
     try {
         if (!newMessage.guild) return;
         if (newMessage.author?.bot) return;
         if (newMessage.author?.id === client.user?.id) return;
+
+        // 👇 SOLO este server
+        if (newMessage.guild.id !== TARGET_GUILD_ID) return;
 
         if (newMessage.partial && newMessage.fetch) {
             await newMessage.fetch().catch(() => {});
@@ -1256,12 +1264,16 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     }
 });
 
+
 // Deletes (global) -> transcript (solo tickets) + webhook de borrados
 client.on('messageDelete', async (message) => {
     try {
         if (!message.guild) return;
         if (message.author?.bot) return;
         if (message.author?.id === client.user?.id) return;
+
+        // 👇 SOLO este server
+        if (message.guild.id !== TARGET_GUILD_ID) return;
 
         const ch = message.channel;
 
@@ -1275,9 +1287,11 @@ client.on('messageDelete', async (message) => {
     }
 });
 
+
 // Cuando se elimina un canal de ticket -> transcript HTML + link
 client.on('channelDelete', async (channel) => {
     try {
+        if (!channel.guild || channel.guild.id !== TARGET_GUILD_ID) return;
         if (!isTicketChannel(channel)) return;
         console.log(`[tickets][CHANNEL DELETE] Canal borrado #${channel.name} (${channel.id})`);
 
@@ -1337,6 +1351,9 @@ client.on('guildBanAdd', async (ban) => {
     try {
         if (!config.BANEADOS_WEBHOOK_URL) return;
         const guild = ban.guild;
+
+        if (!guild || guild.id !== TARGET_GUILD_ID) return;
+
         const user = ban.user;
 
         const { executor, reason } = await findBanExecutorAndReason(guild, user.id);
