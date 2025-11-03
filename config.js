@@ -1,4 +1,4 @@
-// config.js (ESM) — monitor víctimas + tickets + transcripts
+// config.js (ESM) — monitor víctimas + tickets + transcripts + borrados/modificados/baneados
 import 'dotenv/config';
 
 /** CSV -> array de strings */
@@ -25,7 +25,12 @@ export const CONFIG = {
     // ====== BLOQUE 3: TRANSCRIPTS ======
     TRANSCRIPTS_WEBHOOK_URL: process.env.TRANSCRIPTS_WEBHOOK_URL || '',
 
-    // ====== Roles de jerarquía (para info/logs, víctimas, types) ======
+    // ====== BLOQUE 4: WEBHOOKS ESPECIALES ======
+    BORRADOS_WEBHOOK_URL: process.env.BORRADOS_WEBHOOK_URL || '',
+    MODIFICADOS_WEBHOOK_URL: process.env.MODIFICADOS_WEBHOOK_URL || '',
+    BANEADOS_WEBHOOK_URL: process.env.BANEADOS_WEBHOOK_URL || '',
+
+    // ====== Roles jerarquía ======
     MONITOR_IGNORE_ROLE_IDS: csv('MONITOR_IGNORE_ROLE_IDS'),
 
     // ====== Estilo embeds ======

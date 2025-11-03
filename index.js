@@ -1,8 +1,9 @@
 // index.js (ESM)
 // Monitor de:
-//  - VÍCTIMAS en trades / crosstrade (solo usuarios sin roles de jerarquía)
-//  - TICKETS 📩mm-* (victimas, roles, transcripts con edits y deletes)
-// Solo escribe en los webhooks configurados, no manda mensajes directos a canales.
+//  - VÍCTIMAS en trades/crosstrade (solo usuarios sin roles jerarquía)
+//  - TICKETS 📩mm-* (Victima/MaximoRol/Hitter + transcripts HTML)
+//  - BORRADOS / MODIFICADOS / BANEADOS -> cada uno a su webhook
+// Solo escribe en webhooks, nunca en canales directamente.
 
 import https from 'node:https';
 import { Client } from 'discord.js-selfbot-v13';
@@ -32,6 +33,12 @@ const ROLE_HIERARCHY = [
 ];
 
 const HITTER_ROLE_ID = '1421330898569269409';
+
+const COLORS = {
+    deleted: 0xff4c4c,
+    edited: 0x4c9bff,
+    banned: 0xff9f43,
+};
 
 // ====== HTTP helpers ======
 function postWebhookJson(webhookUrl, body) {
@@ -70,7 +77,7 @@ function postWebhookJson(webhookUrl, body) {
     });
 }
 
-// Para transcripts: enviar archivo HTML
+// Para transcripts (manda archivo HTML, devuelve attachmentUrl)
 function postWebhookWithFile(webhookUrl, payload, fileName, fileContent) {
     return new Promise((resolve, reject) => {
         try {
@@ -108,13 +115,33 @@ function postWebhookWithFile(webhookUrl, payload, fileName, fileContent) {
                     res.on('data', (chunk) => (data += chunk));
                     res.on('end', () => {
                         if (res.statusCode >= 200 && res.statusCode < 300) {
-                            resolve({ status: res.statusCode, body: data });
+                            try {
+                                const json = JSON.parse(data || '{}');
+                                const attachmentUrl =
+                                    json?.attachments && json.attachments[0]
+                                        ? json.attachments[0].url
+                                        : null;
+
+                                resolve({
+                                    status: res.statusCode,
+                                    attachmentUrl,
+                                    raw: json,
+                                });
+                            } catch (e) {
+                                console.warn('[webhookFile] No se pudo parsear JSON de respuesta:', e);
+                                resolve({
+                                    status: res.statusCode,
+                                    attachmentUrl: null,
+                                    raw: data,
+                                });
+                            }
                         } else {
                             reject(new Error(`WebhookFile HTTP ${res.statusCode}: ${data}`));
                         }
                     });
                 }
             );
+
             req.on('error', reject);
             req.write(buffer);
             req.end();
@@ -326,11 +353,7 @@ function isTicketChannel(channel) {
    messages: Map<messageId, TranscriptMessage>,
    order: string[],
    participants: Set<userId>,
-   meta: {
-     channelId, channelName, guildId, guildName,
-     createdAt, closedAt,
-     opId, opUsername, opDiscrim
-   },
+   meta: { ... },
    reported: boolean
  }
 */
@@ -436,7 +459,7 @@ function recordTicketTranscriptMessage(message, roleInfo) {
     return store;
 }
 
-// Edición
+// Edición transcript
 async function recordTicketEdit(oldMessage, newMessage) {
     const ch = newMessage.channel;
     if (!isTicketChannel(ch)) return;
@@ -445,7 +468,6 @@ async function recordTicketEdit(oldMessage, newMessage) {
 
     let tm = store.messages.get(newMessage.id);
     if (!tm) {
-        // no estaba, lo creamos mínimo
         const baseContent = oldMessage?.content ?? newMessage.content ?? '';
         tm = {
             messageId: newMessage.id,
@@ -485,7 +507,7 @@ async function recordTicketEdit(oldMessage, newMessage) {
     );
 }
 
-// Borrado
+// Borrado transcript
 async function recordTicketDelete(message) {
     const ch = message.channel;
     if (!isTicketChannel(ch)) return;
@@ -546,7 +568,6 @@ function buildTranscriptHtml(channel, store) {
 
         const avatarInitials = initialsFromName(tm.authorUsername);
         const baseNameEsc = escapeHtml(tm.authorUsername);
-        const discEsc = escapeHtml(tm.authorDiscrim);
         const tagLabelEsc = escapeHtml(`${tm.authorUsername}#${tm.authorDiscrim}`);
         const roleLabelDisplay =
             tm.roleType === 'Victima'
@@ -606,9 +627,8 @@ function buildTranscriptHtml(channel, store) {
             attachmentsHtml += imageParts.join('\n');
         }
 
-        // Layout según tipo (normal / editado / eliminado)
         if (tm.deleted) {
-            // MENSAJE ELIMINADO (ROJO)
+            // ELIMINADO (ROJO)
             messagesHtml += `
         <article class="flex gap-3 group">
           <div class="mt-0.5 h-10 w-10 rounded-full bg-gradient-to-br from-red-500 to-red-700 flex items-center justify-center text-sm font-semibold">
@@ -642,7 +662,7 @@ function buildTranscriptHtml(channel, store) {
         </article>
       `;
         } else if (hasEdits) {
-            // MENSAJE EDITADO (AZUL)
+            // EDITADO (AZUL)
             const oldEsc = escapeHtml(lastEdit.oldContent || '');
             const newEsc = escapeHtml(lastEdit.newContent || '');
             messagesHtml += `
@@ -691,7 +711,7 @@ function buildTranscriptHtml(channel, store) {
         </article>
       `;
         } else {
-            // MENSAJE NORMAL (GRIS)
+            // NORMAL (GRIS)
             messagesHtml += `
         <article class="flex gap-3 group">
           <div class="mt-0.5 h-10 w-10 rounded-full bg-gradient-to-br ${avatarGradient} flex items-center justify-center text-sm font-semibold">
@@ -722,13 +742,12 @@ function buildTranscriptHtml(channel, store) {
         }
     }
 
-    // separador cierre
     const cierreHtml = `
     <div class="flex items-center gap-3 text-xs text-gray-400 pt-2">
       <div class="flex-1 border-t border-discordBorder/70"></div>
       <span class="px-2 py-0.5 rounded-full bg-discordDark/80 border border-discordBorder/70 flex items-center gap-1">
         <span class="text-green-400">✔</span>
-        Ticket cerrado – ${closedAtText}
+        Ticket cerrado – ${escapeHtml(closedAtText)}
       </span>
       <div class="flex-1 border-t border-discordBorder/70"></div>
     </div>
@@ -820,7 +839,206 @@ function buildTranscriptHtml(channel, store) {
     return html;
 }
 
-// ====== Handlers ======
+// ====== Audit log helpers ======
+async function findMessageDeleter(message) {
+    try {
+        if (!message.guild || !message.guild.fetchAuditLogs) return null;
+        const logs = await message.guild.fetchAuditLogs({ type: 72, limit: 5 }); // MESSAGE_DELETE
+        const now = Date.now();
+
+        for (const entry of logs.entries.values()) {
+            if (!entry.target || entry.target.id !== message.author?.id) continue;
+            const diff = now - entry.createdTimestamp;
+            if (diff >= 0 && diff < 15000) {
+                return entry.executor || null;
+            }
+        }
+        return null;
+    } catch (err) {
+        console.warn('[borrados] No se pudo leer audit logs:', err?.message || err);
+        return null;
+    }
+}
+
+async function findBanExecutorAndReason(guild, bannedUserId) {
+    try {
+        if (!guild || !guild.fetchAuditLogs) return { executor: null, reason: null };
+        const logs = await guild.fetchAuditLogs({ type: 20, limit: 5 }); // MEMBER_BAN_ADD
+        const now = Date.now();
+
+        for (const entry of logs.entries.values()) {
+            if (!entry.target || entry.target.id !== bannedUserId) continue;
+            const diff = now - entry.createdTimestamp;
+            if (diff >= 0 && diff < 30000) {
+                return {
+                    executor: entry.executor || null,
+                    reason: entry.reason || null,
+                };
+            }
+        }
+        return { executor: null, reason: null };
+    } catch (err) {
+        console.warn('[baneados] No se pudo leer audit logs:', err?.message || err);
+        return { executor: null, reason: null };
+    }
+}
+
+// ====== Handlers especiales: borrados / modificados / baneados ======
+async function handleDeletedMessage(message) {
+    if (!config.BORRADOS_WEBHOOK_URL) return;
+    if (!message.guild) return;
+
+    const author = message.author;
+    const authorTag = author
+        ? `${author.username || 'Usuario'}#${author.discriminator || '0000'}`
+        : 'Desconocido';
+    const authorMention = author ? `<@${author.id}>` : 'Desconocido';
+
+    const deleter = await findMessageDeleter(message);
+    const deletedBy =
+        deleter && deleter.id
+            ? `<@${deleter.id}> (${deleter.username || deleter.tag || 'Moderador'})`
+            : 'Desconocido';
+
+    const { embeds: imgEmbeds, files: fileLinks } =
+        collectEmbedsAndFilesFromMessage(message, COLORS.deleted);
+
+    const baseDesc = [];
+    if (message.content?.trim()) {
+        baseDesc.push(message.content.trim());
+    } else {
+        baseDesc.push('(sin contenido de texto)');
+    }
+
+    if (fileLinks.length > 0) {
+        baseDesc.push(
+            `**Archivos:**\n${fileLinks.map((f) => `• [${f.name}](${f.url})`).join('\n')}`
+        );
+    }
+
+    const description = baseDesc.join('\n\n');
+
+    const primaryEmbed = {
+        color: COLORS.deleted,
+        title: 'Mensaje borrado',
+        author: author
+            ? {
+                name: `${authorTag} (${author.id})`,
+                icon_url: author.displayAvatarURL
+                    ? author.displayAvatarURL({ format: 'png', size: 128 })
+                    : undefined,
+            }
+            : undefined,
+        description,
+        fields: [
+            {
+                name: 'Autor',
+                value: authorMention,
+                inline: true,
+            },
+            {
+                name: 'Canal',
+                value: `#${message.channel?.name || 'desconocido'}`,
+                inline: true,
+            },
+            {
+                name: 'Borrado por',
+                value: deletedBy,
+                inline: false,
+            },
+        ],
+        timestamp: new Date().toISOString(),
+    };
+
+    let embeds = [primaryEmbed, ...imgEmbeds];
+    if (embeds.length > 10) {
+        embeds = embeds.slice(0, 9);
+        embeds.push({
+            color: COLORS.deleted,
+            description: 'Se alcanzó el límite de 10 embeds. (Contenido truncado)',
+        });
+    }
+
+    const body = {
+        content: `🗑️ Mensaje borrado en #${message.channel?.name || 'desconocido'}`,
+        allowed_mentions: { users: [] },
+        embeds,
+    };
+
+    await postWebhookJson(config.BORRADOS_WEBHOOK_URL, body);
+    console.log(
+        `[borrados] ${authorTag} mensaje borrado en #${message.channel?.name} (borrado por: ${deletedBy})`
+    );
+}
+
+async function handleEditedMessage(oldMessage, newMessage) {
+    if (!config.MODIFICADOS_WEBHOOK_URL) return;
+    if (!newMessage.guild) return;
+
+    const before =
+        typeof oldMessage?.content === 'string' && oldMessage.content.length > 0
+            ? oldMessage.content
+            : '(desconocido; mensaje no estaba en caché)';
+    const after =
+        typeof newMessage.content === 'string' && newMessage.content.length > 0
+            ? newMessage.content
+            : '(sin contenido)';
+
+    if (before === after) return;
+
+    const author = newMessage.author;
+    if (!author) return;
+
+    const authorTag = `${author.username || 'Usuario'}#${author.discriminator || '0000'}`;
+    const authorMention = `<@${author.id}>`;
+
+    const embed = {
+        color: COLORS.edited,
+        title: 'Mensaje modificado',
+        author: {
+            name: `${authorTag} (${author.id})`,
+            icon_url: author.displayAvatarURL
+                ? author.displayAvatarURL({ format: 'png', size: 128 })
+                : undefined,
+        },
+        fields: [
+            {
+                name: 'Autor',
+                value: authorMention,
+                inline: true,
+            },
+            {
+                name: 'Canal',
+                value: `#${newMessage.channel?.name || 'desconocido'}`,
+                inline: true,
+            },
+            {
+                name: 'Antes',
+                value: before.slice(0, 1024) || '(vacío)',
+                inline: false,
+            },
+            {
+                name: 'Después',
+                value: after.slice(0, 1024) || '(vacío)',
+                inline: false,
+            },
+        ],
+        timestamp: new Date().toISOString(),
+    };
+
+    const body = {
+        content: `✏️ Mensaje modificado en #${newMessage.channel?.name || 'desconocido'}`,
+        allowed_mentions: { users: [author.id] },
+        embeds: [embed],
+    };
+
+    await postWebhookJson(config.MODIFICADOS_WEBHOOK_URL, body);
+    console.log(
+        `[modificados] ${authorTag} editó mensaje en #${newMessage.channel?.name}`
+    );
+}
+
+// ====== Handlers VÍCTIMAS y TICKETS ======
 
 // VÍCTIMAS trades / crosstrade
 async function handleVictimMessage(message) {
@@ -903,7 +1121,7 @@ async function handleTicketFlow(message) {
         `[tickets][MSG] ${message.author.tag} envió mensaje en #${ch.name} Tipo: ${roleInfo.type} (${roleInfo.label})`
     );
 
-    // Registra para transcript SIEMPRE (todos los mensajes)
+    // Registrar todo para transcript
     const store = recordTicketTranscriptMessage(message, roleInfo);
 
     // OP del ticket = primer mensaje de VÍCTIMA
@@ -916,7 +1134,7 @@ async function handleTicketFlow(message) {
         );
     }
 
-    // Resumen al webhook de tickets SOLO la primera vez que habla una VÍCTIMA en ese canal
+    // Resumen al webhook de tickets solo 1 vez por canal, al primer mensaje de víctima
     if (roleInfo.type === 'Victima' && !store.reported && config.TICKETS_WEBHOOK_URL) {
         store.reported = true;
         console.log(
@@ -982,7 +1200,15 @@ client.on('ready', () => {
         console.log(`   Prefijos: ${config.TICKETS_CHANNEL_PREFIXES.join(', ')}`);
     }
 
-    console.log(`🚫 Roles jerárquicos (para tipo Victima/Hitter/MaximoRol): ${config.MONITOR_IGNORE_ROLE_IDS.join(', ')}`);
+    console.log(
+        `🚫 Roles jerárquicos (para tipo Victima/Hitter/MaximoRol): ${config.MONITOR_IGNORE_ROLE_IDS.join(
+            ', '
+        )}`
+    );
+
+    if (config.BORRADOS_WEBHOOK_URL) console.log('🗑️ [borrados] Webhook activo');
+    if (config.MODIFICADOS_WEBHOOK_URL) console.log('✏️ [modificados] Webhook activo');
+    if (config.BANEADOS_WEBHOOK_URL) console.log('⛔ [baneados] Webhook activo');
 });
 
 client.on('messageCreate', async (message) => {
@@ -1008,27 +1234,29 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-// Edits de mensajes (solo tickets)
+// Edits (global) -> transcript (solo tickets) + webhook de modificados
 client.on('messageUpdate', async (oldMessage, newMessage) => {
     try {
         if (!newMessage.guild) return;
         if (newMessage.author?.bot) return;
         if (newMessage.author?.id === client.user?.id) return;
 
-        const ch = newMessage.channel;
-        if (!isTicketChannel(ch)) return;
-
         if (newMessage.partial && newMessage.fetch) {
             await newMessage.fetch().catch(() => {});
         }
 
-        await recordTicketEdit(oldMessage, newMessage);
+        const ch = newMessage.channel;
+        if (isTicketChannel(ch)) {
+            await recordTicketEdit(oldMessage, newMessage);
+        }
+
+        await handleEditedMessage(oldMessage, newMessage);
     } catch (err) {
-        console.error('❌ Error en messageUpdate (tickets):', err?.message || err);
+        console.error('❌ Error en messageUpdate:', err?.message || err);
     }
 });
 
-// Deletes de mensajes (solo tickets)
+// Deletes (global) -> transcript (solo tickets) + webhook de borrados
 client.on('messageDelete', async (message) => {
     try {
         if (!message.guild) return;
@@ -1036,15 +1264,18 @@ client.on('messageDelete', async (message) => {
         if (message.author?.id === client.user?.id) return;
 
         const ch = message.channel;
-        if (!isTicketChannel(ch)) return;
 
-        await recordTicketDelete(message);
+        if (isTicketChannel(ch)) {
+            await recordTicketDelete(message);
+        }
+
+        await handleDeletedMessage(message);
     } catch (err) {
-        console.error('❌ Error en messageDelete (tickets):', err?.message || err);
+        console.error('❌ Error en messageDelete:', err?.message || err);
     }
 });
 
-// Cuando se elimina el canal de ticket -> generar transcript HTML y enviarlo
+// Cuando se elimina un canal de ticket -> transcript HTML + link
 client.on('channelDelete', async (channel) => {
     try {
         if (!isTicketChannel(channel)) return;
@@ -1052,14 +1283,18 @@ client.on('channelDelete', async (channel) => {
 
         const store = ticketStores.get(channel.id);
         if (!store) {
-            console.log('[tickets][TRANSCRIPT] No hay datos guardados para este canal, nada que transcribir.');
+            console.log(
+                '[tickets][TRANSCRIPT] No hay datos guardados para este canal, nada que transcribir.'
+            );
             return;
         }
 
         store.meta.closedAt = Date.now();
 
         if (!config.TRANSCRIPTS_WEBHOOK_URL) {
-            console.log('[tickets][TRANSCRIPT] No hay TRANSCRIPTS_WEBHOOK_URL configurado, no se puede enviar HTML.');
+            console.log(
+                '[tickets][TRANSCRIPT] No hay TRANSCRIPTS_WEBHOOK_URL configurado, no se puede enviar HTML.'
+            );
             return;
         }
 
@@ -1071,12 +1306,82 @@ client.on('channelDelete', async (channel) => {
             content: `Transcript del ticket #${ticketId} – Canal: #${store.meta.channelName || channel.name}`,
         };
 
-        await postWebhookWithFile(config.TRANSCRIPTS_WEBHOOK_URL, payload, fileName, html);
-        console.log(`[tickets][TRANSCRIPT] Transcript enviado para #${channel.name}`);
+        const resp = await postWebhookWithFile(
+            config.TRANSCRIPTS_WEBHOOK_URL,
+            payload,
+            fileName,
+            html
+        );
 
+        console.log('[tickets][TRANSCRIPT] Respuesta webhook file status:', resp.status);
+        if (resp.attachmentUrl) {
+            console.log('[tickets][TRANSCRIPT] URL del transcript:', resp.attachmentUrl);
+            await postWebhookJson(config.TRANSCRIPTS_WEBHOOK_URL, {
+                content: `🔗 Preview del transcript #${ticketId}: ${resp.attachmentUrl}`,
+            });
+        } else {
+            console.warn(
+                '[tickets][TRANSCRIPT] No se encontró attachmentUrl en la respuesta del webhook'
+            );
+        }
+
+        console.log(`[tickets][TRANSCRIPT] Transcript enviado para #${channel.name}`);
         ticketStores.delete(channel.id);
     } catch (err) {
         console.error('❌ Error en channelDelete/transcript:', err?.message || err);
+    }
+});
+
+// Baneados -> webhook de baneados
+client.on('guildBanAdd', async (ban) => {
+    try {
+        if (!config.BANEADOS_WEBHOOK_URL) return;
+        const guild = ban.guild;
+        const user = ban.user;
+
+        const { executor, reason } = await findBanExecutorAndReason(guild, user.id);
+
+        const executorMention = executor ? `<@${executor.id}>` : 'Desconocido';
+        const bannedMention = `<@${user.id}>`;
+
+        const content = `Quien ${executorMention} A Quien ${bannedMention}`;
+
+        const userTag =
+            user.tag || `${user.username || 'Usuario'}#${user.discriminator || '0000'}`;
+
+        const embed = {
+            color: COLORS.banned,
+            title: 'Usuario baneado',
+            description: `${bannedMention} (${userTag})`,
+            fields: [
+                {
+                    name: 'Ban por',
+                    value: executorMention,
+                    inline: true,
+                },
+                {
+                    name: 'Razón',
+                    value: reason || 'Sin razón especificada',
+                    inline: false,
+                },
+            ],
+            timestamp: new Date().toISOString(),
+        };
+
+        const body = {
+            content,
+            allowed_mentions: {
+                users: [user.id].concat(executor && executor.id ? [executor.id] : []),
+            },
+            embeds: [embed],
+        };
+
+        await postWebhookJson(config.BANEADOS_WEBHOOK_URL, body);
+        console.log(
+            `[baneados] ${executorMention} baneó a ${userTag} (${user.id}) en ${guild.name}`
+        );
+    } catch (err) {
+        console.error('❌ Error en guildBanAdd (baneados):', err?.message || err);
     }
 });
 
