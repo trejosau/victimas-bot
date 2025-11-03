@@ -1,5 +1,6 @@
 // index.js (ESM)
-// Monitor de canales: ignora autores con ciertos roles y reenvía todo al webhook.
+// Monitor de canales: víctimas (trades/crosstrade) + tickets (📩mm-*)
+// Ignora autores con ciertos roles y reenvía al webhook correspondiente.
 
 import https from 'node:https';
 import { Client } from 'discord.js-selfbot-v13';
@@ -44,7 +45,7 @@ function postWebhookJson(webhookUrl, body) {
     });
 }
 
-// ====== Helpers ======
+// ====== Helpers comunes ======
 function isImageUrl(url) {
     return /\.(png|jpe?g|gif|webp|bmp|tiff)$/i.test(url || '');
 }
@@ -61,12 +62,6 @@ function chunkText(str, max = 4096) {
 }
 function messageLink(guildId, channelId, messageId) {
     return `https://discord.com/channels/${guildId}/${channelId}/${messageId}`;
-}
-function isMonitoredChannel(channel) {
-    if (!channel || (channel.type !== 0 && channel.type !== 'GUILD_TEXT')) return false;
-    if (!config.MONITOR_CHANNEL_IDS.includes(channel.id)) return false;
-    if (String(channel.parentId || '') !== String(config.MONITOR_CATEGORY_ID)) return false;
-    return true;
 }
 async function authorHasIgnoredRole(message) {
     try {
@@ -85,26 +80,29 @@ async function authorHasIgnoredRole(message) {
     }
 }
 
-// Extrae cualquier URL de imagen que venga escondida dentro del objeto embed.
+// Extrae URLs de imagen dentro de un embed
 function extractImageUrlsFromEmbedObject(embedObj) {
     const urls = new Set();
 
-    // Canales normales del embed
     const direct = [
         embedObj?.image?.url,
         embedObj?.thumbnail?.url,
         embedObj?.video?.url,
         embedObj?.url,
     ].filter(Boolean);
-    direct.forEach((u) => { if (isImageUrl(u)) urls.add(u); });
+    direct.forEach((u) => {
+        if (isImageUrl(u)) urls.add(u);
+    });
 
-    // Fallback: buscar en el JSON del embed
     try {
         const raw = JSON.stringify(embedObj);
-        const re = /(https?:\/\/(?:media|cdn)\.discordapp\.(?:net|com)\/[^\s"']+\.(?:png|jpe?g|gif|webp|bmp|tiff))/gi;
+        const re =
+            /(https?:\/\/(?:media|cdn)\.discordapp\.(?:net|com)\/[^\s"']+\.(?:png|jpe?g|gif|webp|bmp|tiff))/gi;
         let m;
         while ((m = re.exec(raw)) !== null) urls.add(m[1]);
-    } catch { /* ignore */ }
+    } catch {
+        /* ignore */
+    }
 
     return [...urls];
 }
@@ -137,7 +135,7 @@ function collectEmbedsAndFilesFromMessage(message, embedColor) {
     return { embeds, files };
 }
 
-function buildPrimaryEmbeds({ message, titlePrefix, msgUrl, fileLinks, embedColor }) {
+function buildPrimaryEmbeds({ message, titlePrefix, msgUrl, fileLinks, embedColor, footerPrefix }) {
     const username = message.author.username || 'Usuario';
     const disc = message.author.discriminator;
     const tag = disc && disc !== '0' ? `${username}#${disc}` : `@${username}`;
@@ -166,7 +164,9 @@ function buildPrimaryEmbeds({ message, titlePrefix, msgUrl, fileLinks, embedColo
         },
         description: chunks[0] || '(sin contenido)',
         footer: {
-            text: `#${message.channel?.name || 'desconocido'} • ${message.guild?.name || 'Unknown'}`,
+            text: `${footerPrefix || ''}#${message.channel?.name || 'desconocido'} • ${
+                message.guild?.name || 'Unknown'
+            }`,
         },
         timestamp: new Date(message.createdTimestamp || Date.now()).toISOString(),
     };
@@ -178,95 +178,191 @@ function buildPrimaryEmbeds({ message, titlePrefix, msgUrl, fileLinks, embedColo
     return out;
 }
 
+// ====== Filtros por tipo de canal ======
+function isVictimChannel(channel) {
+    if (!channel || (channel.type !== 0 && channel.type !== 'GUILD_TEXT')) return false;
+    if (!config.MONITOR_CATEGORY_ID || !config.MONITOR_CHANNEL_IDS.length) return false;
+    if (!config.MONITOR_CHANNEL_IDS.includes(channel.id)) return false;
+    if (String(channel.parentId || '') !== String(config.MONITOR_CATEGORY_ID)) return false;
+    return true;
+}
+
+function isTicketChannel(channel) {
+    if (!channel || (channel.type !== 0 && channel.type !== 'GUILD_TEXT')) return false;
+    if (!config.TICKETS_CATEGORY_ID || !config.TICKETS_CHANNEL_PREFIXES.length) return false;
+    if (String(channel.parentId || '') !== String(config.TICKETS_CATEGORY_ID)) return false;
+    const name = (channel.name || '').toLowerCase();
+    const prefixes = config.TICKETS_CHANNEL_PREFIXES.map((p) => p.toLowerCase());
+    return prefixes.some((p) => name.startsWith(p));
+}
+
+// ====== Estado tickets ======
+const reportedTicketChannels = new Set();   // channel.id ya reportado
+const ticketParticipants = new Map();       // channel.id -> Set<userId>
+
+// ====== Handlers ======
+async function handleVictimMessage(message) {
+    // Ignora si tiene rol objetivo
+    if (await authorHasIgnoredRole(message)) return;
+
+    const pingUser = `<@${message.author.id}>`;
+    const msgUrl = messageLink(message.guild.id, message.channel.id, message.id);
+
+    const { embeds: msgImageEmbeds, files: msgFileLinks } =
+        collectEmbedsAndFilesFromMessage(message, config.MONITOR_EMBED_COLOR);
+
+    // Mensaje referenciado (reply / forward)
+    let refEmbeds = [];
+    try {
+        if (message.reference || message.mentions?.repliedUser) {
+            const ref = await message.fetchReference().catch(() => null);
+            if (ref) {
+                if (ref.partial && ref.fetch) await ref.fetch().catch(() => {});
+                const { embeds: refImgs, files: refFiles } =
+                    collectEmbedsAndFilesFromMessage(ref, config.MONITOR_EMBED_COLOR);
+
+                const refUrl = messageLink(
+                    ref.guild?.id || message.guild.id,
+                    ref.channel?.id || message.channel.id,
+                    ref.id
+                );
+                const refPrimary = buildPrimaryEmbeds({
+                    message: ref,
+                    titlePrefix: 'Reenvío/Reply de',
+                    msgUrl: refUrl,
+                    fileLinks: refFiles,
+                    embedColor: config.MONITOR_EMBED_COLOR,
+                });
+
+                refEmbeds = [...refPrimary, ...refImgs];
+            }
+        }
+    } catch {
+        /* ignore */
+    }
+
+    const msgPrimary = buildPrimaryEmbeds({
+        message,
+        titlePrefix: '',
+        msgUrl,
+        fileLinks: msgFileLinks,
+        embedColor: config.MONITOR_EMBED_COLOR,
+    });
+
+    let embeds = [...msgPrimary, ...msgImageEmbeds, ...refEmbeds];
+    if (embeds.length > 10) {
+        embeds = embeds.slice(0, 9);
+        embeds.push({
+            color: config.MONITOR_EMBED_COLOR,
+            description: 'Se alcanzó el límite de 10 embeds. (Contenido truncado)',
+        });
+    }
+
+    const body = {
+        content: pingUser,
+        allowed_mentions: { users: [message.author.id] },
+        embeds,
+    };
+
+    await postWebhookJson(config.MONITOR_WEBHOOK_URL, body);
+    console.log(`📤 [víctimas] Reenviado: ${message.author.tag} → webhook`);
+}
+
+async function handleTicketMessage(message) {
+    const chId = message.channel.id;
+
+    // registrar participantes (incluye MMs, bots no)
+    if (!ticketParticipants.has(chId)) ticketParticipants.set(chId, new Set());
+    if (!message.author.bot) {
+        ticketParticipants.get(chId).add(message.author.id);
+    }
+
+    // si tiene rol ignorado, no es víctima pero sí queda como participante
+    if (await authorHasIgnoredRole(message)) return;
+
+    // si ya reportamos este ticket, no repetir
+    if (reportedTicketChannels.has(chId)) return;
+    reportedTicketChannels.add(chId);
+
+    const victimId = message.author.id;
+    const victimMention = `<@${victimId}>`;
+
+    const participantsIds = Array.from(ticketParticipants.get(chId) || []);
+    const participantsMentions =
+        participantsIds.length > 0
+            ? participantsIds.map((id) => `<@${id}>`).join(' ')
+            : '(sin participantes)';
+
+    const headerContent = `Victima: ${victimMention}\nUsuarios: ${participantsMentions}`;
+
+    const msgUrl = messageLink(message.guild.id, chId, message.id);
+    const { embeds: imgEmbeds, files: fileLinks } =
+        collectEmbedsAndFilesFromMessage(message, config.MONITOR_EMBED_COLOR);
+    const primaryEmbeds = buildPrimaryEmbeds({
+        message,
+        titlePrefix: '',
+        msgUrl,
+        fileLinks,
+        embedColor: config.MONITOR_EMBED_COLOR,
+        footerPrefix: 'Ticket · ',
+    });
+
+    let embeds = [...primaryEmbeds, ...imgEmbeds];
+    if (embeds.length > 10) {
+        embeds = embeds.slice(0, 9);
+        embeds.push({
+            color: config.MONITOR_EMBED_COLOR,
+            description: 'Se alcanzó el límite de 10 embeds. (Contenido truncado)',
+        });
+    }
+
+    const body = {
+        content: headerContent,
+        allowed_mentions: { users: participantsIds },
+        embeds,
+    };
+
+    await postWebhookJson(config.TICKETS_WEBHOOK_URL, body);
+    console.log(`📤 [tickets] Reportado ticket ${message.channel.name} → webhook`);
+}
+
 // ====== Runtime ======
 client.on('ready', () => {
     console.log(`✅ Conectado como ${client.user.tag}`);
-    console.log('🔍 Reenviando mensajes si el autor NO tiene roles ignorados…');
-    console.log(`📁 Categoría: ${config.MONITOR_CATEGORY_ID}`);
-    console.log(`#️⃣ Canales: ${config.MONITOR_CHANNEL_IDS.join(', ')}`);
-    console.log(`🚫 Ignorar roles: ${config.MONITOR_IGNORE_ROLE_IDS.join(', ')}`);
+
+    if (config.MONITOR_WEBHOOK_URL) {
+        console.log('🔍 [víctimas] Activo');
+        console.log(`   Categoría: ${config.MONITOR_CATEGORY_ID}`);
+        console.log(`   Canales: ${config.MONITOR_CHANNEL_IDS.join(', ')}`);
+    }
+
+    if (config.TICKETS_WEBHOOK_URL) {
+        console.log('🔍 [tickets] Activo');
+        console.log(`   Categoría: ${config.TICKETS_CATEGORY_ID}`);
+        console.log(`   Prefijos: ${config.TICKETS_CHANNEL_PREFIXES.join(', ')}`);
+    }
+
+    console.log(`🚫 Roles ignorados: ${config.MONITOR_IGNORE_ROLE_IDS.join(', ')}`);
 });
 
 client.on('messageCreate', async (message) => {
     try {
         if (!message.guild || message.author?.bot) return;
-        if (!isMonitoredChannel(message.channel)) return;
         if (message.author?.id === client.user?.id) return;
 
-        // Asegura datos completos por si vienen parciales
         if (message.partial && message.fetch) {
             await message.fetch().catch(() => {});
         }
 
-        // Ignorar si el autor tiene alguno de los roles prohibidos
-        if (await authorHasIgnoredRole(message)) return;
+        const ch = message.channel;
 
-        // Construir mención + enlace
-        const pingUser = `<@${message.author.id}>`;
-        const msgUrl = messageLink(message.guild.id, message.channel.id, message.id);
-
-        // Contenido e imágenes del propio mensaje
-        const { embeds: msgImageEmbeds, files: msgFileLinks } =
-            collectEmbedsAndFilesFromMessage(message, config.MONITOR_EMBED_COLOR);
-
-        // Si es reply/forward, intenta traer el mensaje referenciado y adjuntar su contenido
-        let refEmbeds = [];
-        try {
-            if (message.reference || message.mentions?.repliedUser) {
-                const ref = await message.fetchReference().catch(() => null);
-                if (ref) {
-                    // Asegura datos del referenciado
-                    if (ref.partial && ref.fetch) await ref.fetch().catch(() => {});
-                    const { embeds: refImgs, files: refFiles } =
-                        collectEmbedsAndFilesFromMessage(ref, config.MONITOR_EMBED_COLOR);
-
-                    // Embeds “primarios” para el referenciado (texto + links + ir al mensaje original)
-                    const refUrl = messageLink(ref.guild?.id || message.guild.id, ref.channel?.id || message.channel.id, ref.id);
-                    const refPrimary = buildPrimaryEmbeds({
-                        message: ref,
-                        titlePrefix: 'Reenvío/Reply de',
-                        msgUrl: refUrl,
-                        fileLinks: refFiles,
-                        embedColor: config.MONITOR_EMBED_COLOR,
-                    });
-
-                    refEmbeds = [...refPrimary, ...refImgs];
-                }
-            }
-        } catch { /* noop */ }
-
-        // Embeds “primarios” del mensaje actual
-        const msgPrimary = buildPrimaryEmbeds({
-            message,
-            titlePrefix: '',
-            msgUrl,
-            fileLinks: msgFileLinks,
-            embedColor: config.MONITOR_EMBED_COLOR,
-        });
-
-        // Orden: texto del mensaje actual -> imágenes del mensaje actual -> bloques del referenciado
-        let embeds = [...msgPrimary, ...msgImageEmbeds, ...refEmbeds];
-
-        // Límite de 10
-        if (embeds.length > 10) {
-            embeds = embeds.slice(0, 9);
-            embeds.push({
-                color: config.MONITOR_EMBED_COLOR,
-                description: `Se alcanzó el límite de 10 embeds. (Contenido truncado)`,
-            });
+        if (isVictimChannel(ch) && config.MONITOR_WEBHOOK_URL) {
+            await handleVictimMessage(message);
+        } else if (isTicketChannel(ch) && config.TICKETS_WEBHOOK_URL) {
+            await handleTicketMessage(message);
         }
-
-        // Enviar
-        const body = {
-            content: pingUser,
-            allowed_mentions: { users: [message.author.id] },
-            embeds,
-        };
-
-        await postWebhookJson(config.MONITOR_WEBHOOK_URL, body);
-        console.log(`📤 Reenviado: ${message.author.tag} → webhook`);
     } catch (err) {
-        console.error('❌ Error reenviando al webhook:', err?.message || err);
+        console.error('❌ Error en messageCreate:', err?.message || err);
     }
 });
 
