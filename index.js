@@ -1,8 +1,11 @@
 // index.js (ESM)
 // Monitor de:
-//  - VÍCTIMAS en trades/crosstrade (solo usuarios sin roles jerarquía)
-//  - TICKETS 📩mm-* (Victima/MaximoRol/Hitter + transcripts HTML)
-//  - BORRADOS / MODIFICADOS / BANEADOS -> cada uno a su webhook
+//  - VÍCTIMAS SafeCat en trades/crosstrade (solo usuarios sin roles jerarquía) -> MONITOR_WEBHOOK_URL
+//  - VÍCTIMAS GLOBALES en muchos servers/canales -> GLOBAL_VICTIM_WEBHOOK_URL
+//      * En SafeCat: solo Victima (sin jerarquía / hitter)
+//      * En otros servers: TODO lo que llegue
+//  - TICKETS 📩mm-* (Victima/MaximoRol/Hitter + transcripts HTML) [SOLO server principal]
+//  - BORRADOS / MODIFICADOS / BANEADOS -> cada uno a su webhook [SOLO server principal]
 // Solo escribe en webhooks, nunca en canales directamente.
 
 import https from 'node:https';
@@ -11,9 +14,10 @@ import { CONFIG as config } from './config.js';
 
 const client = new Client();
 
+// ====== GUILD principal (Safe Cat) ======
 const TARGET_GUILD_ID = config.GUILD_ID || '1376127147847979050';
 
-// ====== ROLES JERARQUÍA (orden de mayor a menor) ======
+// ====== ROLES JERARQUÍA (orden de mayor a menor) — SOLO se usan en TARGET_GUILD_ID ======
 const ROLE_HIERARCHY = [
     { id: '1432128766347313192', key: 'owner', label: 'Owner' },
     { id: '1421330806399565888', key: 'comandante', label: 'Comandante' },
@@ -41,6 +45,62 @@ const COLORS = {
     edited: 0x4c9bff,
     banned: 0xff9f43,
 };
+
+// ====== VÍCTIMAS GLOBALES (servers/canales externos) ======
+// Solo estos pares (guildId, channelId) se envían al GLOBAL_VICTIM_WEBHOOK_URL
+const GLOBAL_VICTIM_CHANNELS = {
+    // server: 1379903029460996137 canal: 1429669144009117818
+    '1379903029460996137': ['1429669144009117818'],
+
+    // server 1377051353490391162 canal 1383567918188728471
+    '1377051353490391162': ['1383567918188728471'],
+
+    // server 1325277506957213816 canales 1407968964923101244, 1416897400521359531
+    '1325277506957213816': ['1407968964923101244', '1416897400521359531'],
+
+    // server 1392228891535474760 canal 1392484472468799488
+    '1392228891535474760': ['1392484472468799488'],
+
+    // server 1386044817330671696 canal 1410740016325591100
+    '1386044817330671696': ['1410740016325591100'],
+
+    // server 1167866589144686603 canales 1428137518104318045, 1428137519588835388
+    '1167866589144686603': ['1428137518104318045', '1428137519588835388'],
+
+    // server 1396981360761241732 canal 1408948401470439527
+    '1396981360761241732': ['1408948401470439527'],
+
+    // server 1034844508539596820 canal 1395497866210050118
+    '1034844508539596820': ['1395497866210050118'],
+
+    // server 1217946897340436511 canal 1431138860108091432
+    '1217946897340436511': ['1431138860108091432'],
+
+    // server 1333115747920248873 canales 1434669835782197258,1390781336348000356,1390790178121187539
+    '1333115747920248873': [
+        '1434669835782197258',
+        '1390781336348000356',
+        '1390790178121187539',
+    ],
+
+    // server 1382792643154546718 canales 1384978914270642286, 1408674384377544804
+    '1382792643154546718': ['1384978914270642286', '1408674384377544804'],
+
+    // server 1387155968055316600 canales 1433085817827495969, 1433084423997362276, 1433084318393041007
+    '1387155968055316600': [
+        '1433085817827495969',
+        '1433084423997362276',
+        '1433084318393041007',
+    ],
+
+    // server 1433084318393041007 canales 1426448433815752845, 1426448908015501363
+    '1433084318393041007': ['1426448433815752845', '1426448908015501363'],
+
+    // server 1368183361637715968 canales 1371993335509815316, 1398417727068311552
+    '1368183361637715968': ['1371993335509815316', '1398417727068311552'],
+};
+
+const GLOBAL_VICTIM_WEBHOOK_URL = config.GLOBAL_VICTIM_WEBHOOK_URL || '';
 
 // ====== HTTP helpers ======
 function postWebhookJson(webhookUrl, body) {
@@ -193,14 +253,16 @@ function initialsFromName(name = '') {
     return (parts[0][0] + parts[1][0]).toUpperCase();
 }
 
-// ====== Roles / tipo usuario ======
+// ====== Roles / tipo usuario — SOLO se usa en TARGET_GUILD_ID ======
 async function getMemberRoleInfo(message) {
+    if (!message.guild || message.guild.id !== TARGET_GUILD_ID) {
+        return { member: null, highestRole: null, type: 'Desconocido', label: 'Usuario' };
+    }
+
     let member = message.member;
     try {
         if (!member && message.guild) {
-            member = await message.guild.members
-                .fetch(message.author.id)
-                .catch(() => null);
+            member = await message.guild.members.fetch(message.author.id).catch(() => null);
         }
     } catch {
         member = null;
@@ -288,7 +350,14 @@ function collectEmbedsAndFilesFromMessage(message, embedColor) {
     return { embeds, files };
 }
 
-function buildPrimaryEmbeds({ message, titlePrefix, msgUrl, fileLinks, embedColor, footerPrefix }) {
+function buildPrimaryEmbeds({
+                                message,
+                                titlePrefix,
+                                msgUrl,
+                                fileLinks,
+                                embedColor,
+                                footerPrefix,
+                            }) {
     const username = message.author.username || 'Usuario';
     const disc = message.author.discriminator;
     const tag = disc && disc !== '0' ? `${username}#${disc}` : `@${username}`;
@@ -331,7 +400,7 @@ function buildPrimaryEmbeds({ message, titlePrefix, msgUrl, fileLinks, embedColo
     return out;
 }
 
-// ====== Filtros de canal ======
+// ====== Filtros de canal (SafeCat) ======
 function isVictimChannel(channel) {
     if (!channel || (channel.type !== 0 && channel.type !== 'GUILD_TEXT')) return false;
     if (!config.MONITOR_CATEGORY_ID || !config.MONITOR_CHANNEL_IDS.length) return false;
@@ -347,6 +416,13 @@ function isTicketChannel(channel) {
     const name = (channel.name || '').toLowerCase();
     const prefixes = config.TICKETS_CHANNEL_PREFIXES.map((p) => p.toLowerCase());
     return prefixes.some((p) => name.startsWith(p));
+}
+
+// ====== Filtro: canal de víctimas globales (cualquier GUILD) ======
+function isGlobalVictimChannel(guildId, channelId) {
+    const list = GLOBAL_VICTIM_CHANNELS[String(guildId)];
+    if (!list) return false;
+    return list.includes(String(channelId));
 }
 
 // ====== TICKETS: store para transcripts y resumen ======
@@ -416,7 +492,9 @@ function recordTicketTranscriptMessage(message, roleInfo) {
         tm = {
             messageId,
             authorId: message.author.id,
-            authorTag: `${message.author.username || 'Usuario'}#${message.author.discriminator || '0000'}`,
+            authorTag: `${message.author.username || 'Usuario'}#${
+                message.author.discriminator || '0000'
+            }`,
             authorUsername: message.author.username || 'Usuario',
             authorDiscrim: message.author.discriminator || '0000',
             roleType: roleInfo.type,
@@ -474,7 +552,9 @@ async function recordTicketEdit(oldMessage, newMessage) {
         tm = {
             messageId: newMessage.id,
             authorId: newMessage.author?.id || 'unknown',
-            authorTag: `${newMessage.author?.username || 'Desconocido'}#${newMessage.author?.discriminator || '0000'}`,
+            authorTag: `${newMessage.author?.username || 'Desconocido'}#${
+                newMessage.author?.discriminator || '0000'
+            }`,
             authorUsername: newMessage.author?.username || 'Desconocido',
             authorDiscrim: newMessage.author?.discriminator || '0000',
             roleType: roleInfo.type,
@@ -489,7 +569,9 @@ async function recordTicketEdit(oldMessage, newMessage) {
         };
         store.messages.set(newMessage.id, tm);
         store.order.push(newMessage.id);
-        console.log(`[tickets][EDIT] Mensaje no estaba en store, creado para ${tm.authorTag} en #${ch.name}`);
+        console.log(
+            `[tickets][EDIT] Mensaje no estaba en store, creado para ${tm.authorTag} en #${ch.name}`
+        );
     }
 
     const oldContent = tm.contentCurrent || oldMessage?.content || '';
@@ -522,7 +604,9 @@ async function recordTicketDelete(message) {
         tm = {
             messageId: message.id,
             authorId: message.author?.id || 'unknown',
-            authorTag: `${message.author?.username || 'Desconocido'}#${message.author?.discriminator || '0000'}`,
+            authorTag: `${message.author?.username || 'Desconocido'}#${
+                message.author?.discriminator || '0000'
+            }`,
             authorUsername: message.author?.username || 'Desconocido',
             authorDiscrim: message.author?.discriminator || '0000',
             roleType: roleInfo.type,
@@ -885,10 +969,10 @@ async function findBanExecutorAndReason(guild, bannedUserId) {
     }
 }
 
-// ====== Handlers especiales: borrados / modificados / baneados ======
+// ====== Handlers especiales: borrados / modificados / baneados (SOLO SafeCat) ======
 async function handleDeletedMessage(message) {
     if (!config.BORRADOS_WEBHOOK_URL) return;
-    if (!message.guild) return;
+    if (!message.guild || message.guild.id !== TARGET_GUILD_ID) return;
 
     const author = message.author;
     const authorTag = author
@@ -975,7 +1059,7 @@ async function handleDeletedMessage(message) {
 
 async function handleEditedMessage(oldMessage, newMessage) {
     if (!config.MODIFICADOS_WEBHOOK_URL) return;
-    if (!newMessage.guild) return;
+    if (!newMessage.guild || newMessage.guild.id !== TARGET_GUILD_ID) return;
 
     const before =
         typeof oldMessage?.content === 'string' && oldMessage.content.length > 0
@@ -1040,16 +1124,15 @@ async function handleEditedMessage(oldMessage, newMessage) {
     );
 }
 
-// ====== Handlers VÍCTIMAS y TICKETS ======
+// ====== Handlers VÍCTIMAS SafeCat + VÍCTIMAS GLOBALES + TICKETS ======
 
-// VÍCTIMAS trades / crosstrade
-async function handleVictimMessage(message) {
+// VÍCTIMAS SafeCat trades / crosstrade → solo Victima (sin roles jerarquía)
+async function handleSafeCatVictimMessage(message) {
     const roleInfo = await getMemberRoleInfo(message);
     console.log(
-        `[victimas] ${message.author.tag} envió mensaje en #${message.channel.name} Tipo: ${roleInfo.type} (${roleInfo.label})`
+        `[victimas-SafeCat] ${message.author.tag} en #${message.channel.name} Tipo: ${roleInfo.type} (${roleInfo.label})`
     );
 
-    // Víctima = NO tener ningún rol de jerarquía
     if (roleInfo.type !== 'Victima') return;
 
     const pingUser = `<@${message.author.id}>`;
@@ -1111,10 +1194,76 @@ async function handleVictimMessage(message) {
     };
 
     await postWebhookJson(config.MONITOR_WEBHOOK_URL, body);
-    console.log(`📤 [víctimas] Reenviado: ${message.author.tag} → webhook`);
+    console.log(`📤 [víctimas-SafeCat] Reenviado: ${message.author.tag} → MONITOR_WEBHOOK_URL`);
 }
 
-// TICKETS: resumen (Victima) + transcripts
+// VÍCTIMAS GLOBALES (nuevo webhook)
+// - SafeCat trades/crosstrade: sólo Victima (sin roles jerarquía / hitter)
+// - Otros servers/canales configurados: TODO lo que llegue (sin roles)
+async function handleGlobalVictimMessage(message) {
+    if (!GLOBAL_VICTIM_WEBHOOK_URL) return;
+    if (!message.guild) return;
+
+    const guildId = message.guild.id;
+    const channel = message.channel;
+    const channelId = channel.id;
+
+    let forward = false;
+
+    if (guildId === TARGET_GUILD_ID && isVictimChannel(channel)) {
+        // SafeCat trades/crosstrade -> sólo Victima
+        const roleInfo = await getMemberRoleInfo(message);
+        console.log(
+            `[victimas-GLOBAL] (SafeCat) ${message.author.tag} en #${channel.name} Tipo: ${roleInfo.type} (${roleInfo.label})`
+        );
+        if (roleInfo.type === 'Victima') forward = true;
+    } else if (isGlobalVictimChannel(guildId, channelId)) {
+        // Otros servers/canales → TODO
+        console.log(
+            `[victimas-GLOBAL] ${message.author.tag} en #${channel.name} (guild ${guildId})`
+        );
+        forward = true;
+    }
+
+    if (!forward) return;
+
+    const pingUser = `<@${message.author.id}>`;
+    const msgUrl = messageLink(guildId, channelId, message.id);
+
+    const { embeds: msgImageEmbeds, files: msgFileLinks } =
+        collectEmbedsAndFilesFromMessage(message, config.MONITOR_EMBED_COLOR);
+
+    const msgPrimary = buildPrimaryEmbeds({
+        message,
+        titlePrefix: '',
+        msgUrl,
+        fileLinks: msgFileLinks,
+        embedColor: config.MONITOR_EMBED_COLOR,
+        footerPrefix: 'Global Victimas · ',
+    });
+
+    let embeds = [...msgPrimary, ...msgImageEmbeds];
+    if (embeds.length > 10) {
+        embeds = embeds.slice(0, 9);
+        embeds.push({
+            color: config.MONITOR_EMBED_COLOR,
+            description: 'Se alcanzó el límite de 10 embeds. (Contenido truncado)',
+        });
+    }
+
+    const body = {
+        content: pingUser,
+        allowed_mentions: { users: [message.author.id] },
+        embeds,
+    };
+
+    await postWebhookJson(GLOBAL_VICTIM_WEBHOOK_URL, body);
+    console.log(
+        `📤 [victimas-GLOBAL] Reenviado: ${message.author.tag} (guild ${guildId}) → GLOBAL_VICTIM_WEBHOOK_URL`
+    );
+}
+
+// TICKETS: resumen (Victima) + transcripts (SOLO SafeCat)
 async function handleTicketFlow(message) {
     const ch = message.channel;
     const roleInfo = await getMemberRoleInfo(message);
@@ -1186,31 +1335,38 @@ async function handleTicketFlow(message) {
     }
 }
 
-// ====== Runtime ======
+// ====== Runtime & eventos ======
 client.on('ready', () => {
     console.log(`✅ Conectado como ${client.user.tag}`);
 
     if (config.MONITOR_WEBHOOK_URL) {
-        console.log('🔍 [víctimas] Activo');
+        console.log('🔍 [víctimas SafeCat] Activo');
+        console.log(`   GUILD_ID: ${TARGET_GUILD_ID}`);
         console.log(`   Categoría: ${config.MONITOR_CATEGORY_ID}`);
         console.log(`   Canales: ${config.MONITOR_CHANNEL_IDS.join(', ')}`);
     }
 
+    if (GLOBAL_VICTIM_WEBHOOK_URL) {
+        console.log('🌐 [víctimas GLOBAL] Activo');
+        console.log('   Servers/canales configurados:');
+        for (const [gid, chans] of Object.entries(GLOBAL_VICTIM_CHANNELS)) {
+            console.log(`   - Guild ${gid}: ${chans.join(', ')}`);
+        }
+        console.log(
+            `   Además: trades/crosstrade de SafeCat (solo Victima) también se envían aquí.`
+        );
+    }
+
     if (config.TICKETS_WEBHOOK_URL || config.TRANSCRIPTS_WEBHOOK_URL) {
-        console.log('🔍 [tickets] Activo');
+        console.log('🔍 [tickets] Activo (SOLO SafeCat)');
         console.log(`   Categoría: ${config.TICKETS_CATEGORY_ID}`);
         console.log(`   Prefijos: ${config.TICKETS_CHANNEL_PREFIXES.join(', ')}`);
     }
 
-    console.log(
-        `🚫 Roles jerárquicos (para tipo Victima/Hitter/MaximoRol): ${config.MONITOR_IGNORE_ROLE_IDS.join(
-            ', '
-        )}`
-    );
-
-    if (config.BORRADOS_WEBHOOK_URL) console.log('🗑️ [borrados] Webhook activo');
-    if (config.MODIFICADOS_WEBHOOK_URL) console.log('✏️ [modificados] Webhook activo');
-    if (config.BANEADOS_WEBHOOK_URL) console.log('⛔ [baneados] Webhook activo');
+    if (config.BORRADOS_WEBHOOK_URL) console.log('🗑️ [borrados] Webhook activo (SOLO SafeCat)');
+    if (config.MODIFICADOS_WEBHOOK_URL)
+        console.log('✏️ [modificados] Webhook activo (SOLO SafeCat)');
+    if (config.BANEADOS_WEBHOOK_URL) console.log('⛔ [baneados] Webhook activo (SOLO SafeCat)');
 });
 
 client.on('messageCreate', async (message) => {
@@ -1218,18 +1374,31 @@ client.on('messageCreate', async (message) => {
         if (!message.guild || message.author?.bot) return;
         if (message.author?.id === client.user?.id) return;
 
-        if (message.guild.id !== TARGET_GUILD_ID) return;
-
         if (message.partial && message.fetch) {
             await message.fetch().catch(() => {});
         }
 
+        const guildId = message.guild.id;
         const ch = message.channel;
 
-        if (isVictimChannel(ch) && config.MONITOR_WEBHOOK_URL) {
-            await handleVictimMessage(message);
+        // 1) VÍCTIMAS SafeCat (trades/crosstrade) -> MONITOR_WEBHOOK_URL
+        if (
+            guildId === TARGET_GUILD_ID &&
+            isVictimChannel(ch) &&
+            config.MONITOR_WEBHOOK_URL
+        ) {
+            await handleSafeCatVictimMessage(message);
         }
 
+        // 2) VÍCTIMAS GLOBAL (SafeCat Victima + otros servers/canales) -> GLOBAL_VICTIM_WEBHOOK_URL
+        if (GLOBAL_VICTIM_WEBHOOK_URL) {
+            await handleGlobalVictimMessage(message);
+        }
+
+        // A partir de aquí, SOLO server principal para tickets / borrados / modificados
+        if (guildId !== TARGET_GUILD_ID) return;
+
+        // 3) TICKETS 📩mm-* (SOLO SafeCat)
         if (isTicketChannel(ch)) {
             await handleTicketFlow(message);
         }
@@ -1238,23 +1407,20 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-
-// Edits (global) -> transcript (solo tickets) + webhook de modificados
+// Edits (global) -> transcript (solo tickets SafeCat) + webhook de modificados (SafeCat)
 client.on('messageUpdate', async (oldMessage, newMessage) => {
     try {
         if (!newMessage.guild) return;
         if (newMessage.author?.bot) return;
         if (newMessage.author?.id === client.user?.id) return;
 
-        // 👇 SOLO este server
-        if (newMessage.guild.id !== TARGET_GUILD_ID) return;
-
         if (newMessage.partial && newMessage.fetch) {
             await newMessage.fetch().catch(() => {});
         }
 
         const ch = newMessage.channel;
-        if (isTicketChannel(ch)) {
+
+        if (newMessage.guild.id === TARGET_GUILD_ID && isTicketChannel(ch)) {
             await recordTicketEdit(oldMessage, newMessage);
         }
 
@@ -1264,20 +1430,16 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     }
 });
 
-
-// Deletes (global) -> transcript (solo tickets) + webhook de borrados
+// Deletes (global) -> transcript (solo tickets SafeCat) + webhook de borrados (SafeCat)
 client.on('messageDelete', async (message) => {
     try {
         if (!message.guild) return;
         if (message.author?.bot) return;
         if (message.author?.id === client.user?.id) return;
 
-        // 👇 SOLO este server
-        if (message.guild.id !== TARGET_GUILD_ID) return;
-
         const ch = message.channel;
 
-        if (isTicketChannel(ch)) {
+        if (message.guild.id === TARGET_GUILD_ID && isTicketChannel(ch)) {
             await recordTicketDelete(message);
         }
 
@@ -1287,8 +1449,7 @@ client.on('messageDelete', async (message) => {
     }
 });
 
-
-// Cuando se elimina un canal de ticket -> transcript HTML + link
+// Cuando se elimina un canal de ticket -> transcript HTML + link (SOLO SafeCat)
 client.on('channelDelete', async (channel) => {
     try {
         if (!channel.guild || channel.guild.id !== TARGET_GUILD_ID) return;
@@ -1317,7 +1478,9 @@ client.on('channelDelete', async (channel) => {
         const fileName = `transcript-${ticketId}-${channel.id}.html`;
 
         const payload = {
-            content: `Transcript del ticket #${ticketId} – Canal: #${store.meta.channelName || channel.name}`,
+            content: `Transcript del ticket #${ticketId} – Canal: #${
+                store.meta.channelName || channel.name
+            }`,
         };
 
         const resp = await postWebhookWithFile(
@@ -1346,7 +1509,7 @@ client.on('channelDelete', async (channel) => {
     }
 });
 
-// Baneados -> webhook de baneados
+// Baneados -> webhook de baneados (SOLO SafeCat)
 client.on('guildBanAdd', async (ban) => {
     try {
         if (!config.BANEADOS_WEBHOOK_URL) return;
