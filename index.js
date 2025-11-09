@@ -413,10 +413,23 @@ function isTicketChannel(channel) {
     if (!channel || (channel.type !== 0 && channel.type !== 'GUILD_TEXT')) return false;
     if (!config.TICKETS_CATEGORY_ID || !config.TICKETS_CHANNEL_PREFIXES.length) return false;
     if (String(channel.parentId || '') !== String(config.TICKETS_CATEGORY_ID)) return false;
+
     const name = (channel.name || '').toLowerCase();
     const prefixes = config.TICKETS_CHANNEL_PREFIXES.map((p) => p.toLowerCase());
-    return prefixes.some((p) => name.startsWith(p));
+
+    return prefixes.some((p) => {
+        // Si el prefijo termina en * (ej: "mm-*"), lo tomamos como comodín
+        if (p.endsWith('*')) {
+            const base = p.slice(0, -1); // "mm-* " -> "mm-"
+            // aquí usas includes para "que contengan esto en el nombre"
+            return name.includes(base);
+        }
+
+        // Prefijos normales siguen funcionando como antes
+        return name.startsWith(p);
+    });
 }
+
 
 // ====== Filtro: canal de víctimas globales (cualquier GUILD) ======
 function isGlobalVictimChannel(guildId, channelId) {
