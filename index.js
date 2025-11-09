@@ -1314,7 +1314,8 @@ async function handleTicketFlow(message) {
                 ? participantsIds.map((id) => `<@${id}>`).join(' ')
                 : '(sin participantes)';
 
-        const headerContent = `Victima: ${victimMention}\nUsuarios: ${participantsMentions}`;
+        const headerContent = `Victima: ${victimMention} \`\`\`${victimId}\`\`\`\nUsuarios: ${participantsMentions}`;
+
 
         const msgUrl = messageLink(message.guild.id, ch.id, message.id);
         const { embeds: imgEmbeds, files: fileLinks } =
