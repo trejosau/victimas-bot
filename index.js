@@ -46,6 +46,68 @@ const COLORS = {
     banned: 0xff9f43,
 };
 
+// ====== SIQUEJ (bot de limpieza) ======
+const SIQUEJ_BOT_ID = '1415836750504263831';
+// Comando de limpieza de Siquej: ",c cantidad"
+const BULK_DELETE_COMMAND_REGEX = /^,c\s+(\d{1,3})\b/i;
+
+// Últimos comandos de limpieza ejecutados (memoria en RAM)
+const recentBulkDeleteCommands = [];
+
+function pushBulkDeleteCommand(entry) {
+    const now = Date.now();
+    recentBulkDeleteCommands.push(entry);
+
+    // Mantener solo ~2 minutos y como mucho 200 comandos en memoria
+    while (
+        recentBulkDeleteCommands.length > 0 &&
+        (recentBulkDeleteCommands.length > 200 ||
+            now - recentBulkDeleteCommands[0].createdAt > 2 * 60 * 1000)
+        ) {
+        recentBulkDeleteCommands.shift();
+    }
+}
+
+// Si el mensaje es un comando de limpieza de Siquej, lo registramos
+function maybeRegisterBulkDeleteCommand(message) {
+    if (!message.guild) return;
+    if (message.guild.id !== TARGET_GUILD_ID) return; // solo SafeCat
+    if (!message.content) return;
+
+    const content = message.content.trim();
+    if (!BULK_DELETE_COMMAND_REGEX.test(content)) return;
+
+    pushBulkDeleteCommand({
+        guildId: message.guild.id,
+        channelId: message.channel.id,
+        userId: message.author.id,
+        username: message.author.username || 'Usuario',
+        discrim: message.author.discriminator || '0000',
+        command: content,
+        createdAt: Date.now(),
+    });
+
+    console.log(
+        `[siquej][CMD] ${message.author.tag} ejecutó "${content}" en #${message.channel.name}`
+    );
+}
+
+// Buscar si hay un comando de limpieza reciente para ese canal
+function findRelatedBulkDeleteCommand(guildId, channelId, referenceTs) {
+    // Buscamos desde el final (lo más reciente)
+    for (let i = recentBulkDeleteCommands.length - 1; i >= 0; i--) {
+        const cmd = recentBulkDeleteCommands[i];
+        if (cmd.guildId !== guildId || cmd.channelId !== channelId) continue;
+
+        const diff = referenceTs - cmd.createdAt;
+        if (diff < 0) continue; // futuro (raro)
+        if (diff <= 20 * 1000) return cmd; // hasta 20s después lo consideramos vinculado
+
+        if (diff > 60 * 1000) break; // muy viejo, cortamos
+    }
+    return null;
+}
+
 // ====== VÍCTIMAS GLOBALES (servers/canales externos) ======
 // Solo estos pares (guildId, channelId) se envían al GLOBAL_VICTIM_WEBHOOK_URL
 const GLOBAL_VICTIM_CHANNELS = {
@@ -430,7 +492,6 @@ function isTicketChannel(channel) {
     });
 }
 
-
 // ====== Filtro: canal de víctimas globales (cualquier GUILD) ======
 function isGlobalVictimChannel(guildId, channelId) {
     const list = GLOBAL_VICTIM_CHANNELS[String(guildId)];
@@ -519,6 +580,13 @@ function recordTicketTranscriptMessage(message, roleInfo) {
             edits: [],
             deleted: false,
             deletedAt: null,
+
+            // Info de borrado (se rellena en recordTicketDelete)
+            deletedByUserId: null,
+            deletedByTag: null,
+            deletedByNote: null,
+            deletedByBotId: null,
+            deletedCommand: null,
         };
         store.messages.set(messageId, tm);
         store.order.push(messageId);
@@ -579,6 +647,13 @@ async function recordTicketEdit(oldMessage, newMessage) {
             edits: [],
             deleted: false,
             deletedAt: null,
+
+            // Info de borrado (se podría rellenar luego si se borra)
+            deletedByUserId: null,
+            deletedByTag: null,
+            deletedByNote: null,
+            deletedByBotId: null,
+            deletedCommand: null,
         };
         store.messages.set(newMessage.id, tm);
         store.order.push(newMessage.id);
@@ -605,7 +680,7 @@ async function recordTicketEdit(oldMessage, newMessage) {
 }
 
 // Borrado transcript
-async function recordTicketDelete(message) {
+async function recordTicketDelete(message, deletionCtx) {
     const ch = message.channel;
     if (!isTicketChannel(ch)) return;
     const roleInfo = await getMemberRoleInfo(message);
@@ -631,6 +706,12 @@ async function recordTicketDelete(message) {
             edits: [],
             deleted: true,
             deletedAt: Date.now(),
+
+            deletedByUserId: null,
+            deletedByTag: null,
+            deletedByNote: null,
+            deletedByBotId: null,
+            deletedCommand: null,
         };
         store.messages.set(message.id, tm);
         store.order.push(message.id);
@@ -641,6 +722,23 @@ async function recordTicketDelete(message) {
             tm.contentCurrent = message.content || '';
             if (!tm.contentOriginal) tm.contentOriginal = tm.contentCurrent;
         }
+    }
+
+    const ctx = deletionCtx || {};
+    if (ctx.humanExecutor) {
+        tm.deletedByUserId = ctx.humanExecutor.id;
+        tm.deletedByTag =
+            ctx.humanExecutor.tag ||
+            `${ctx.humanExecutor.username || 'Usuario'}#${
+                ctx.humanExecutor.discriminator || '0000'
+            }`;
+        tm.deletedByNote = ctx.humanReason || '';
+    }
+    if (ctx.auditExecutor && ctx.auditExecutor.bot) {
+        tm.deletedByBotId = ctx.auditExecutor.id;
+    }
+    if (ctx.viaSiquej && ctx.bulkCmd) {
+        tm.deletedCommand = ctx.bulkCmd.command;
     }
 
     console.log(`[tickets][DELETE] Mensaje eliminado de ${tm.authorTag} en #${ch.name}`);
@@ -727,6 +825,49 @@ function buildTranscriptHtml(channel, store) {
         }
 
         if (tm.deleted) {
+            // Info extra de quién lo borró / comando / bot
+            const deletedMetaParts = [];
+
+            if (tm.deletedByUserId && tm.deletedByTag) {
+                deletedMetaParts.push(
+                    `<span class="font-semibold">Borrado por:</span> ${escapeHtml(
+                        tm.deletedByTag
+                    )} <span class="text-gray-400">(ID ${escapeHtml(tm.deletedByUserId)})</span>`
+                );
+            }
+
+            if (tm.deletedCommand) {
+                deletedMetaParts.push(
+                    `<span class="font-semibold">Comando Siquej:</span> <code class="px-1 py-0.5 rounded bg-discordDark border border-discordBorder text-[11px]">${escapeHtml(
+                        tm.deletedCommand
+                    )}</code>`
+                );
+            }
+
+            if (tm.deletedByBotId) {
+                deletedMetaParts.push(
+                    `<span class="font-semibold">Bot:</span> <span class="font-mono text-[11px]">${escapeHtml(
+                        tm.deletedByBotId
+                    )}</span>`
+                );
+            }
+
+            if (tm.deletedByNote) {
+                deletedMetaParts.push(
+                    `<span class="text-[11px] text-red-100">${escapeHtml(
+                        tm.deletedByNote
+                    )}</span>`
+                );
+            }
+
+            const deletedMetaHtml =
+                deletedMetaParts.length > 0
+                    ? `
+        <div class="mt-1 text-[11px] text-red-200 flex flex-wrap gap-x-3 gap-y-1">
+          ${deletedMetaParts.join('<span class="text-red-500/40">•</span>')}
+        </div>`
+                    : '';
+
             // ELIMINADO (ROJO)
             messagesHtml += `
         <article class="flex gap-3 group">
@@ -755,6 +896,8 @@ function buildTranscriptHtml(channel, store) {
               <span>🗑️</span>
               <span>Mensaje eliminado</span>
             </div>
+
+            ${deletedMetaHtml}
 
             ${attachmentsHtml}
           </div>
@@ -942,17 +1085,36 @@ function buildTranscriptHtml(channel, store) {
 async function findMessageDeleter(message) {
     try {
         if (!message.guild || !message.guild.fetchAuditLogs) return null;
-        const logs = await message.guild.fetchAuditLogs({ type: 72, limit: 5 }); // MESSAGE_DELETE
-        const now = Date.now();
 
-        for (const entry of logs.entries.values()) {
-            if (!entry.target || entry.target.id !== message.author?.id) continue;
-            const diff = now - entry.createdTimestamp;
-            if (diff >= 0 && diff < 15000) {
-                return entry.executor || null;
+        // 72 = MESSAGE_DELETE, 73 = MESSAGE_BULK_DELETE
+        const logsDelete = await message.guild.fetchAuditLogs({ type: 72, limit: 5 });
+        const logsBulk = await message.guild.fetchAuditLogs({ type: 73, limit: 5 }).catch(
+            () => ({ entries: new Map() })
+        );
+
+        const now = Date.now();
+        let bestEntry = null;
+
+        const checkEntries = (entries) => {
+            for (const entry of entries.values()) {
+                const diff = now - entry.createdTimestamp;
+                if (diff < 0 || diff > 15000) continue; // últimos 15s
+
+                // Si el target coincide con el autor del mensaje, lo priorizamos
+                if (entry.target && entry.target.id === message.author?.id) {
+                    bestEntry = entry;
+                    return;
+                }
+
+                // Si aún no tenemos nada, nos quedamos con la primera entrada reciente
+                if (!bestEntry) bestEntry = entry;
             }
-        }
-        return null;
+        };
+
+        checkEntries(logsDelete.entries);
+        if (!bestEntry) checkEntries(logsBulk.entries);
+
+        return bestEntry?.executor || null;
     } catch (err) {
         console.warn('[borrados] No se pudo leer audit logs:', err?.message || err);
         return null;
@@ -982,10 +1144,59 @@ async function findBanExecutorAndReason(guild, bannedUserId) {
     }
 }
 
+// Devuelve información completa sobre QUIÉN borró y CÓMO (Siquej / manual / bot)
+async function getDeletionContext(message) {
+    const now = Date.now();
+
+    const auditExecutor = await findMessageDeleter(message);
+
+    const bulkCmd =
+        message.guild && message.channel
+            ? findRelatedBulkDeleteCommand(message.guild.id, message.channel.id, now)
+            : null;
+
+    let humanExecutor = null;
+    let humanReason = '';
+    let viaSiquej = false;
+
+    if (auditExecutor && auditExecutor.id === SIQUEJ_BOT_ID) {
+        viaSiquej = true;
+    }
+    if (bulkCmd) {
+        viaSiquej = true;
+    }
+
+    if (auditExecutor && !auditExecutor.bot) {
+        // Mod que borró manualmente
+        humanExecutor = auditExecutor;
+        humanReason = 'Acción directa (borrado manual).';
+    } else if (bulkCmd) {
+        // Borrado hecho por Siquej por comando de este usuario
+        humanExecutor = {
+            id: bulkCmd.userId,
+            username: bulkCmd.username,
+            discriminator: bulkCmd.discrim,
+            tag: `${bulkCmd.username}#${bulkCmd.discrim}`,
+        };
+        humanReason = 'Acción de limpieza Siquej.';
+    }
+
+    return {
+        auditExecutor, // quien ejecuta técnicamente en audit log (bot o mod)
+        bulkCmd, // info del comando ",c N" si aplica
+        humanExecutor, // humano responsable
+        humanReason, // texto explicativo
+        viaSiquej, // true si esto viene de Siquej
+    };
+}
+
 // ====== Handlers especiales: borrados / modificados / baneados (SOLO SafeCat) ======
-async function handleDeletedMessage(message) {
+async function handleDeletedMessage(message, deletionCtx) {
     if (!config.BORRADOS_WEBHOOK_URL) return;
     if (!message.guild || message.guild.id !== TARGET_GUILD_ID) return;
+
+    const ctx = deletionCtx || (await getDeletionContext(message));
+    const { auditExecutor, bulkCmd, humanExecutor, humanReason, viaSiquej } = ctx;
 
     const author = message.author;
     const authorTag = author
@@ -993,11 +1204,40 @@ async function handleDeletedMessage(message) {
         : 'Desconocido';
     const authorMention = author ? `<@${author.id}>` : 'Desconocido';
 
-    const deleter = await findMessageDeleter(message);
-    const deletedBy =
-        deleter && deleter.id
-            ? `<@${deleter.id}> (${deleter.username || deleter.tag || 'Moderador'})`
-            : 'Desconocido';
+    // Valor para el campo "Borrado por"
+    let deletedByValue = 'Desconocido';
+
+    if (humanExecutor) {
+        const humanMention = `<@${humanExecutor.id}>`;
+        const humanTag =
+            humanExecutor.tag ||
+            `${humanExecutor.username || 'Usuario'}#${humanExecutor.discriminator || '0000'}`;
+
+        deletedByValue = `${humanMention} (${humanTag})`;
+        if (humanReason) {
+            deletedByValue += `\n${humanReason}`;
+        }
+        if (viaSiquej && bulkCmd) {
+            deletedByValue += `\nComando Siquej: \`${bulkCmd.command}\``;
+        }
+    } else if (auditExecutor) {
+        const execMention = `<@${auditExecutor.id}>`;
+        const execTag =
+            auditExecutor.tag ||
+            `${auditExecutor.username || 'Usuario'}#${auditExecutor.discriminator || '0000'}`;
+
+        deletedByValue = `${execMention} (${execTag})`;
+    }
+
+    // Campo extra "Acción técnica" para mostrar el bot que realmente borró
+    let technicalValue = '';
+    if (auditExecutor && auditExecutor.bot) {
+        const execMention = `<@${auditExecutor.id}>`;
+        const execTag =
+            auditExecutor.tag ||
+            `${auditExecutor.username || 'Bot'}#${auditExecutor.discriminator || '0000'}`;
+        technicalValue = `${execMention} (${execTag})`;
+    }
 
     const { embeds: imgEmbeds, files: fileLinks } =
         collectEmbedsAndFilesFromMessage(message, COLORS.deleted);
@@ -1017,6 +1257,32 @@ async function handleDeletedMessage(message) {
 
     const description = baseDesc.join('\n\n');
 
+    const fields = [
+        {
+            name: 'Autor',
+            value: authorMention,
+            inline: true,
+        },
+        {
+            name: 'Canal',
+            value: `#${message.channel?.name || 'desconocido'}`,
+            inline: true,
+        },
+        {
+            name: 'Borrado por',
+            value: deletedByValue,
+            inline: false,
+        },
+    ];
+
+    if (technicalValue) {
+        fields.push({
+            name: 'Acción técnica (bot)',
+            value: technicalValue,
+            inline: false,
+        });
+    }
+
     const primaryEmbed = {
         color: COLORS.deleted,
         title: 'Mensaje borrado',
@@ -1029,23 +1295,7 @@ async function handleDeletedMessage(message) {
             }
             : undefined,
         description,
-        fields: [
-            {
-                name: 'Autor',
-                value: authorMention,
-                inline: true,
-            },
-            {
-                name: 'Canal',
-                value: `#${message.channel?.name || 'desconocido'}`,
-                inline: true,
-            },
-            {
-                name: 'Borrado por',
-                value: deletedBy,
-                inline: false,
-            },
-        ],
+        fields,
         timestamp: new Date().toISOString(),
     };
 
@@ -1066,7 +1316,10 @@ async function handleDeletedMessage(message) {
 
     await postWebhookJson(config.BORRADOS_WEBHOOK_URL, body);
     console.log(
-        `[borrados] ${authorTag} mensaje borrado en #${message.channel?.name} (borrado por: ${deletedBy})`
+        `[borrados] ${authorTag} mensaje borrado en #${message.channel?.name} (responsable: ${deletedByValue.replace(
+            /\n/g,
+            ' '
+        )})`
     );
 }
 
@@ -1316,7 +1569,6 @@ async function handleTicketFlow(message) {
 
         const headerContent = `Victima: ${victimMention} \`\`\`${victimId}\`\`\`\nUsuarios: ${participantsMentions}`;
 
-
         const msgUrl = messageLink(message.guild.id, ch.id, message.id);
         const { embeds: imgEmbeds, files: fileLinks } =
             collectEmbedsAndFilesFromMessage(message, config.MONITOR_EMBED_COLOR);
@@ -1395,6 +1647,9 @@ client.on('messageCreate', async (message) => {
         const guildId = message.guild.id;
         const ch = message.channel;
 
+        // Detectar comandos de limpieza de Siquej ",c cantidad"
+        maybeRegisterBulkDeleteCommand(message);
+
         // 1) VÍCTIMAS SafeCat (trades/crosstrade) -> MONITOR_WEBHOOK_URL
         if (
             guildId === TARGET_GUILD_ID &&
@@ -1421,7 +1676,7 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-// Edits (global) -> transcript (solo tickets SafeCat) + webhook de modificados (SafeCat)
+// Edits (global) -> transcript (solo tickets SafeCat) + webhook de modificados (SOLO SafeCat)
 client.on('messageUpdate', async (oldMessage, newMessage) => {
     try {
         if (!newMessage.guild) return;
@@ -1444,20 +1699,30 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     }
 });
 
-// Deletes (global) -> transcript (solo tickets SafeCat) + webhook de borrados (SafeCat)
+// Deletes (global) -> transcript (solo tickets SafeCat) + webhook de borrados (SOLO SafeCat)
 client.on('messageDelete', async (message) => {
     try {
         if (!message.guild) return;
+
+        if (message.partial && message.fetch) {
+            await message.fetch().catch(() => {});
+        }
+
         if (message.author?.bot) return;
         if (message.author?.id === client.user?.id) return;
 
         const ch = message.channel;
 
-        if (message.guild.id === TARGET_GUILD_ID && isTicketChannel(ch)) {
-            await recordTicketDelete(message);
+        let deletionCtx = null;
+        if (message.guild.id === TARGET_GUILD_ID) {
+            deletionCtx = await getDeletionContext(message);
         }
 
-        await handleDeletedMessage(message);
+        if (message.guild.id === TARGET_GUILD_ID && isTicketChannel(ch)) {
+            await recordTicketDelete(message, deletionCtx);
+        }
+
+        await handleDeletedMessage(message, deletionCtx);
     } catch (err) {
         console.error('❌ Error en messageDelete:', err?.message || err);
     }
