@@ -1230,22 +1230,13 @@ async function getDeletionContext(message) {
     };
 }
 
-// ====== Handlers especiales: borrados / modificados / baneados (SOLO SafeCat) ======
-async function handleDeletedMessage(message, deletionCtx) {
-    if (!config.BORRADOS_WEBHOOK_URL) return;
-    if (!message.guild || message.guild.id !== TARGET_GUILD_ID) return;
+// === NUEVO: resumir contexto de eliminación (para single y bulk) ===
+function summarizeDeletionContext(ctx) {
+    const { auditExecutor, bulkCmd, humanExecutor, humanReason, viaSiquej } = ctx || {};
 
-    const ctx = deletionCtx || (await getDeletionContext(message));
-    const { auditExecutor, bulkCmd, humanExecutor, humanReason, viaSiquej } = ctx;
-
-    const author = message.author;
-    const authorTag = author
-        ? `${author.username || 'Usuario'}#${author.discriminator || '0000'}`
-        : 'Desconocido';
-    const authorMention = author ? `<@${author.id}>` : 'Desconocido';
-
-    // Valor para el campo "Borrado por"
     let deletedByValue = 'Desconocido';
+    let technicalValue = '';
+    let deletionType = 'Desconocido';
 
     if (humanExecutor) {
         const humanMention = `<@${humanExecutor.id}>`;
@@ -1269,8 +1260,7 @@ async function handleDeletedMessage(message, deletionCtx) {
         deletedByValue = `${execMention} (${execTag})`;
     }
 
-    // Campo extra "Acción técnica" para mostrar el bot que realmente borró
-    let technicalValue = '';
+    // Bot que realmente ejecutó la acción
     if (auditExecutor && auditExecutor.bot) {
         const execMention = `<@${auditExecutor.id}>`;
         const execTag =
@@ -1278,6 +1268,32 @@ async function handleDeletedMessage(message, deletionCtx) {
             `${auditExecutor.username || 'Bot'}#${auditExecutor.discriminator || '0000'}`;
         technicalValue = `${execMention} (${execTag})`;
     }
+
+    // Tipo de eliminación: manual / bot / limpieza Siquej
+    if (viaSiquej && bulkCmd) {
+        deletionType = 'Limpieza Siquej (,c)';
+    } else if (humanExecutor && !(auditExecutor && auditExecutor.bot)) {
+        deletionType = 'Manual';
+    } else if (auditExecutor && auditExecutor.bot) {
+        deletionType = 'Automática (bot)';
+    }
+
+    return { deletedByValue, technicalValue, deletionType };
+}
+
+// ====== Handlers especiales: borrados / modificados / baneados (SOLO SafeCat) ======
+async function handleDeletedMessage(message, deletionCtx) {
+    if (!config.BORRADOS_WEBHOOK_URL) return;
+    if (!message.guild || message.guild.id !== TARGET_GUILD_ID) return;
+
+    const ctx = deletionCtx || (await getDeletionContext(message));
+    const { deletedByValue, technicalValue, deletionType } = summarizeDeletionContext(ctx);
+
+    const author = message.author;
+    const authorTag = author
+        ? `${author.username || 'Usuario'}#${author.discriminator || '0000'}`
+        : 'Desconocido';
+    const authorMention = author ? `<@${author.id}>` : 'Desconocido';
 
     const { embeds: imgEmbeds, files: fileLinks } =
         collectEmbedsAndFilesFromMessage(message, COLORS.deleted);
@@ -1306,6 +1322,11 @@ async function handleDeletedMessage(message, deletionCtx) {
         {
             name: 'Canal',
             value: `#${message.channel?.name || 'desconocido'}`,
+            inline: true,
+        },
+        {
+            name: 'Tipo de eliminación',
+            value: deletionType,
             inline: true,
         },
         {
@@ -1360,6 +1381,151 @@ async function handleDeletedMessage(message, deletionCtx) {
             /\n/g,
             ' '
         )})`
+    );
+}
+
+// NUEVO: borrados masivos por Siquej (,c X) → un solo embed
+async function handleBulkDeletedMessages(messages, deletionCtx) {
+    if (!config.BORRADOS_WEBHOOK_URL) return;
+    if (!messages || !messages.length) return;
+
+    const sample = messages[0];
+    if (!sample.guild || sample.guild.id !== TARGET_GUILD_ID) return;
+
+    const ctx = deletionCtx || (await getDeletionContext(sample));
+    const { deletedByValue, technicalValue, deletionType } = summarizeDeletionContext(ctx);
+    const { bulkCmd, humanExecutor } = ctx || {};
+
+    // Ordenamos por fecha (de más viejo a más nuevo) para que sea "los X de arriba"
+    const sorted = [...messages].sort(
+        (a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0)
+    );
+
+    const lines = [];
+
+    for (let i = 0; i < sorted.length; i++) {
+        const m = sorted[i];
+
+        const author = m.author;
+        const authorLabel = author
+            ? `<@${author.id}> (${author.username || 'Usuario'}#${author.discriminator || '0000'})`
+            : 'Autor desconocido';
+
+        let baseText = '';
+        if (m.content?.trim()) {
+            baseText = m.content.trim().replace(/\s+/g, ' ');
+        } else {
+            baseText = '(sin contenido de texto)';
+        }
+
+        // Limitamos un poco para no pasarnos del límite del embed
+        if (baseText.length > 350) {
+            baseText = baseText.slice(0, 347) + '...';
+        }
+
+        const channelName = m.channel?.name || 'desconocido';
+        const hasFiles =
+            (m.attachments && m.attachments.size > 0) ||
+            (Array.isArray(m.embeds) && m.embeds.length > 0);
+        const filesTag = hasFiles ? ' 📎' : '';
+
+        lines.push(
+            `**${i + 1}.** ${authorLabel} en #${channelName}${filesTag}\n${baseText}`
+        );
+    }
+
+    // Juntamos todo el texto en bloques para respetar 4096 chars
+    const descriptionFull = lines.join('\n\n');
+    const chunks = chunkText(descriptionFull, 3500); // dejamos margen para la nota final
+
+    const channelName = sample.channel?.name || 'desconocido';
+    const guildName = sample.guild?.name || 'Unknown';
+    const nowIso = new Date().toISOString();
+
+    const fields = [
+        {
+            name: 'Cantidad',
+            value: String(sorted.length),
+            inline: true,
+        },
+        {
+            name: 'Tipo de eliminación',
+            value: deletionType,
+            inline: true,
+        },
+        {
+            name: 'Borrado por',
+            value: deletedByValue,
+            inline: false,
+        },
+    ];
+
+    if (technicalValue) {
+        fields.push({
+            name: 'Acción técnica (bot)',
+            value: technicalValue,
+            inline: false,
+        });
+    }
+
+    if (bulkCmd) {
+        fields.push({
+            name: 'Comando',
+            value: `\`${bulkCmd.command}\``,
+            inline: true,
+        });
+    }
+
+    const embeds = [];
+
+    if (chunks.length > 0) {
+        embeds.push({
+            color: COLORS.deleted,
+            title: `Mensajes borrados (${sorted.length})`,
+            description: chunks[0],
+            footer: {
+                text: `#${channelName} • ${guildName}`,
+            },
+            timestamp: nowIso,
+            fields,
+        });
+    }
+
+    for (let i = 1; i < chunks.length; i++) {
+        embeds.push({
+            color: COLORS.deleted,
+            description: chunks[i],
+        });
+    }
+
+    // Nota al final del último embed:
+    // "X usuario ejecutó ,c X"
+    if (bulkCmd && humanExecutor) {
+        const executorMention = `<@${humanExecutor.id}>`;
+        const last = embeds[embeds.length - 1];
+        const note = `\n\n**Ejecutado por:** ${executorMention} \`${bulkCmd.command}\``;
+        last.description = (last.description || '') + note;
+    }
+
+    // Por seguridad, no más de 10 embeds
+    if (embeds.length > 10) {
+        embeds.length = 10;
+        embeds[embeds.length - 1].description =
+            (embeds[embeds.length - 1].description || '') +
+            '\n\nSe alcanzó el límite de 10 embeds. (Contenido truncado)';
+    }
+
+    const body = {
+        content: `🧹 ${sorted.length} mensajes borrados en #${channelName} (limpieza Siquej)`,
+        allowed_mentions: { users: [] },
+        embeds,
+    };
+
+    await postWebhookJson(config.BORRADOS_WEBHOOK_URL, body);
+
+    const responsableLog = deletedByValue.replace(/\n/g, ' ');
+    console.log(
+        `[borrados][bulk] ${sorted.length} mensajes borrados en #${channelName} (responsable: ${responsableLog})`
     );
 }
 
@@ -1793,12 +1959,15 @@ client.on('messageDeleteBulk', async (messages) => {
         // Nunca reaccionar a nosotros mismos
         if (sample.author?.id === client.user?.id) return;
 
+        const isSafeCat = sample.guild.id === TARGET_GUILD_ID;
+
         let deletionCtx = null;
-        if (sample.guild.id === TARGET_GUILD_ID) {
+        if (isSafeCat) {
             // Calculamos el contexto una sola vez (Siquej / comando / audit log)
             deletionCtx = await getDeletionContext(sample);
         }
 
+        // 1) Siempre registramos transcript de tickets (si aplica)
         for (const msg of arr) {
             const m = msg;
 
@@ -1808,12 +1977,22 @@ client.on('messageDeleteBulk', async (messages) => {
 
             if (m.author?.id === client.user?.id) continue;
 
-            if (m.guild.id === TARGET_GUILD_ID && isTicketChannel(m.channel)) {
+            if (isSafeCat && isTicketChannel(m.channel)) {
                 await recordTicketDelete(m, deletionCtx);
             }
+        }
 
-            if (m.guild.id === TARGET_GUILD_ID) {
-                await handleDeletedMessage(m, deletionCtx);
+        // 2) Enviar a webhook de borrados
+        if (isSafeCat) {
+            // Si viene de Siquej + tiene comando ,c X → 1 solo embed agrupado
+            if (deletionCtx?.viaSiquej && deletionCtx.bulkCmd) {
+                await handleBulkDeletedMessages(arr, deletionCtx);
+            } else {
+                // Cualquier otro bulk delete → se comporta como antes (uno por mensaje)
+                for (const m of arr) {
+                    if (m.author?.id === client.user?.id) continue;
+                    await handleDeletedMessage(m, deletionCtx);
+                }
             }
         }
     } catch (err) {
