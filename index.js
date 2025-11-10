@@ -73,6 +73,7 @@ function maybeRegisterBulkDeleteCommand(message) {
     if (!message.guild) return;
     if (message.guild.id !== TARGET_GUILD_ID) return; // solo SafeCat
     if (!message.content) return;
+    if (message.author?.bot) return; // el comando siempre lo ejecuta un usuario
 
     const content = message.content.trim();
     if (!BULK_DELETE_COMMAND_REGEX.test(content)) return;
@@ -313,6 +314,40 @@ function initialsFromName(name = '') {
     if (parts.length === 0) return '?';
     if (parts.length === 1) return parts[0].slice(0, 2).toUpperCase();
     return (parts[0][0] + parts[1][0]).toUpperCase();
+}
+
+// Texto completo para transcripts: contenido + embeds (título, descripción, fields)
+function getMessageTextForTranscript(message) {
+    const parts = [];
+
+    if (message?.content && message.content.trim()) {
+        parts.push(message.content.trim());
+    }
+
+    if (Array.isArray(message?.embeds) && message.embeds.length > 0) {
+        for (const e of message.embeds) {
+            const embedLines = [];
+
+            if (e.title) embedLines.push(e.title);
+            if (e.description) embedLines.push(e.description);
+
+            if (Array.isArray(e.fields) && e.fields.length > 0) {
+                for (const f of e.fields) {
+                    const name = f.name || '';
+                    const value = f.value || '';
+                    if (!name && !value) continue;
+                    if (name && value) embedLines.push(`${name}: ${value}`);
+                    else embedLines.push(name || value);
+                }
+            }
+
+            if (embedLines.length > 0) {
+                parts.push(embedLines.join('\n'));
+            }
+        }
+    }
+
+    return parts.join('\n\n');
 }
 
 // ====== Roles / tipo usuario — SOLO se usa en TARGET_GUILD_ID ======
@@ -563,6 +598,8 @@ function recordTicketTranscriptMessage(message, roleInfo) {
     const messageId = message.id;
     let tm = store.messages.get(messageId);
     if (!tm) {
+        const baseText = getMessageTextForTranscript(message) || '';
+
         tm = {
             messageId,
             authorId: message.author.id,
@@ -574,8 +611,8 @@ function recordTicketTranscriptMessage(message, roleInfo) {
             roleType: roleInfo.type,
             roleLabel: roleInfo.label,
             createdAt: ts,
-            contentOriginal: message.content || '',
-            contentCurrent: message.content || '',
+            contentOriginal: baseText,
+            contentCurrent: baseText,
             attachments: [],
             edits: [],
             deleted: false,
@@ -629,7 +666,11 @@ async function recordTicketEdit(oldMessage, newMessage) {
 
     let tm = store.messages.get(newMessage.id);
     if (!tm) {
-        const baseContent = oldMessage?.content ?? newMessage.content ?? '';
+        const baseText =
+            getMessageTextForTranscript(newMessage) ||
+            getMessageTextForTranscript(oldMessage) ||
+            '';
+
         tm = {
             messageId: newMessage.id,
             authorId: newMessage.author?.id || 'unknown',
@@ -641,14 +682,13 @@ async function recordTicketEdit(oldMessage, newMessage) {
             roleType: roleInfo.type,
             roleLabel: roleInfo.label,
             createdAt: newMessage.createdTimestamp || Date.now(),
-            contentOriginal: baseContent,
-            contentCurrent: baseContent,
+            contentOriginal: baseText,
+            contentCurrent: baseText,
             attachments: [],
             edits: [],
             deleted: false,
             deletedAt: null,
 
-            // Info de borrado (se podría rellenar luego si se borra)
             deletedByUserId: null,
             deletedByTag: null,
             deletedByNote: null,
@@ -662,8 +702,8 @@ async function recordTicketEdit(oldMessage, newMessage) {
         );
     }
 
-    const oldContent = tm.contentCurrent || oldMessage?.content || '';
-    const newContent = newMessage.content || '';
+    const oldContent = tm.contentCurrent || getMessageTextForTranscript(oldMessage) || '';
+    const newContent = getMessageTextForTranscript(newMessage) || '';
 
     if (oldContent === newContent) return;
 
@@ -688,7 +728,7 @@ async function recordTicketDelete(message, deletionCtx) {
 
     let tm = store.messages.get(message.id);
     if (!tm) {
-        const baseContent = message.content ?? '';
+        const baseText = getMessageTextForTranscript(message) || '';
         tm = {
             messageId: message.id,
             authorId: message.author?.id || 'unknown',
@@ -700,8 +740,8 @@ async function recordTicketDelete(message, deletionCtx) {
             roleType: roleInfo.type,
             roleLabel: roleInfo.label,
             createdAt: message.createdTimestamp || Date.now(),
-            contentOriginal: baseContent,
-            contentCurrent: baseContent,
+            contentOriginal: baseText,
+            contentCurrent: baseText,
             attachments: [],
             edits: [],
             deleted: true,
@@ -719,7 +759,7 @@ async function recordTicketDelete(message, deletionCtx) {
         tm.deleted = true;
         tm.deletedAt = Date.now();
         if (!tm.contentCurrent) {
-            tm.contentCurrent = message.content || '';
+            tm.contentCurrent = getMessageTextForTranscript(message) || '';
             if (!tm.contentOriginal) tm.contentOriginal = tm.contentCurrent;
         }
     }
@@ -1538,7 +1578,7 @@ async function handleTicketFlow(message) {
         `[tickets][MSG] ${message.author.tag} envió mensaje en #${ch.name} Tipo: ${roleInfo.type} (${roleInfo.label})`
     );
 
-    // Registrar todo para transcript
+    // Registrar todo para transcript (incluye bots, embeds, adjuntos)
     const store = recordTicketTranscriptMessage(message, roleInfo);
 
     // OP del ticket = primer mensaje de VÍCTIMA
@@ -1637,20 +1677,33 @@ client.on('ready', () => {
 
 client.on('messageCreate', async (message) => {
     try {
-        if (!message.guild || message.author?.bot) return;
-        if (message.author?.id === client.user?.id) return;
+        if (!message.guild) return;
 
         if (message.partial && message.fetch) {
             await message.fetch().catch(() => {});
         }
 
+        // Nunca reaccionar a nosotros mismos
+        if (message.author?.id === client.user?.id) return;
+
         const guildId = message.guild.id;
         const ch = message.channel;
 
-        // Detectar comandos de limpieza de Siquej ",c cantidad"
-        maybeRegisterBulkDeleteCommand(message);
+        // 1) TICKETS 📩mm-* (SOLO SafeCat) – transcripts + resumen
+        //    Aquí queremos TODO: usuarios + bots (TicketKing, etc.)
+        if (guildId === TARGET_GUILD_ID && isTicketChannel(ch)) {
+            await handleTicketFlow(message);
+        }
 
-        // 1) VÍCTIMAS SafeCat (trades/crosstrade) -> MONITOR_WEBHOOK_URL
+        // A partir de aquí, solo usuarios (no bots) para resto de lógica
+        if (message.author?.bot) return;
+
+        // 2) Registrar comando de limpieza de Siquej ",c cantidad" (cualquier canal de SafeCat)
+        if (guildId === TARGET_GUILD_ID) {
+            maybeRegisterBulkDeleteCommand(message);
+        }
+
+        // 3) VÍCTIMAS SafeCat (trades/crosstrade) -> MONITOR_WEBHOOK_URL
         if (
             guildId === TARGET_GUILD_ID &&
             isVictimChannel(ch) &&
@@ -1659,17 +1712,9 @@ client.on('messageCreate', async (message) => {
             await handleSafeCatVictimMessage(message);
         }
 
-        // 2) VÍCTIMAS GLOBAL (SafeCat Victima + otros servers/canales) -> GLOBAL_VICTIM_WEBHOOK_URL
+        // 4) VÍCTIMAS GLOBAL (SafeCat Victima + otros servers/canales) -> GLOBAL_VICTIM_WEBHOOK_URL
         if (GLOBAL_VICTIM_WEBHOOK_URL) {
             await handleGlobalVictimMessage(message);
-        }
-
-        // A partir de aquí, SOLO server principal para tickets / borrados / modificados
-        if (guildId !== TARGET_GUILD_ID) return;
-
-        // 3) TICKETS 📩mm-* (SOLO SafeCat)
-        if (isTicketChannel(ch)) {
-            await handleTicketFlow(message);
         }
     } catch (err) {
         console.error('❌ Error en messageCreate:', err?.message || err);
@@ -1699,7 +1744,7 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     }
 });
 
-// Deletes (global) -> transcript (solo tickets SafeCat) + webhook de borrados (SOLO SafeCat)
+// Deletes (global) -> transcripts (tickets SafeCat) + webhook de borrados (SOLO SafeCat)
 client.on('messageDelete', async (message) => {
     try {
         if (!message.guild) return;
@@ -1708,7 +1753,7 @@ client.on('messageDelete', async (message) => {
             await message.fetch().catch(() => {});
         }
 
-        if (message.author?.bot) return;
+        // Nunca reaccionar a nosotros mismos
         if (message.author?.id === client.user?.id) return;
 
         const ch = message.channel;
@@ -1718,13 +1763,61 @@ client.on('messageDelete', async (message) => {
             deletionCtx = await getDeletionContext(message);
         }
 
+        // Transcripts de tickets (SafeCat) – marcar en rojo si sabemos que fue borrado
         if (message.guild.id === TARGET_GUILD_ID && isTicketChannel(ch)) {
             await recordTicketDelete(message, deletionCtx);
         }
 
-        await handleDeletedMessage(message, deletionCtx);
+        // Webhook de borrados (SOLO SafeCat)
+        if (message.guild.id === TARGET_GUILD_ID) {
+            await handleDeletedMessage(message, deletionCtx);
+        }
     } catch (err) {
         console.error('❌ Error en messageDelete:', err?.message || err);
+    }
+});
+
+// Deletes masivos (bulk) -> transcripts (tickets SafeCat) + webhook de borrados (SOLO SafeCat)
+client.on('messageDeleteBulk', async (messages) => {
+    try {
+        const arr = [...messages.values()];
+        if (!arr.length) return;
+
+        const sample = arr[0];
+        if (!sample.guild) return;
+
+        if (sample.partial && sample.fetch) {
+            await sample.fetch().catch(() => {});
+        }
+
+        // Nunca reaccionar a nosotros mismos
+        if (sample.author?.id === client.user?.id) return;
+
+        let deletionCtx = null;
+        if (sample.guild.id === TARGET_GUILD_ID) {
+            // Calculamos el contexto una sola vez (Siquej / comando / audit log)
+            deletionCtx = await getDeletionContext(sample);
+        }
+
+        for (const msg of arr) {
+            const m = msg;
+
+            if (m.partial && m.fetch) {
+                await m.fetch().catch(() => {});
+            }
+
+            if (m.author?.id === client.user?.id) continue;
+
+            if (m.guild.id === TARGET_GUILD_ID && isTicketChannel(m.channel)) {
+                await recordTicketDelete(m, deletionCtx);
+            }
+
+            if (m.guild.id === TARGET_GUILD_ID) {
+                await handleDeletedMessage(m, deletionCtx);
+            }
+        }
+    } catch (err) {
+        console.error('❌ Error en messageDeleteBulk:', err?.message || err);
     }
 });
 
