@@ -6,6 +6,7 @@
 //      * En otros servers: TODO lo que llegue
 //  - TICKETS 📩mm-* (Victima/MaximoRol/Hitter + transcripts HTML) [SOLO server principal]
 //  - BORRADOS / MODIFICADOS / BANEADOS -> cada uno a su webhook [SOLO server principal]
+//  - Mensajes con ,ban / ,unban -> mismo webhook de baneados
 // Solo escribe en webhooks, nunca en canales directamente.
 
 import https from 'node:https';
@@ -44,6 +45,7 @@ const COLORS = {
     deleted: 0xff4c4c,
     edited: 0x4c9bff,
     banned: 0xff9f43,
+    deletedEmbed: 0xff66cc, // rosa para contenido de embeds borrados
 };
 
 // ====== SIQUEJ (bot de limpieza) ======
@@ -447,6 +449,72 @@ function collectEmbedsAndFilesFromMessage(message, embedColor) {
     return { embeds, files };
 }
 
+// Embeds de contenido textual (título/descr/fields) de los embeds borrados → rosa
+function buildContentEmbedsFromOriginalEmbeds(message) {
+    const out = [];
+
+    if (!Array.isArray(message.embeds) || message.embeds.length === 0) {
+        return out;
+    }
+
+    for (const e of message.embeds) {
+        if (!e) continue;
+
+        const hasTitle =
+            typeof e.title === 'string' && e.title.trim().length > 0;
+        const hasDesc =
+            typeof e.description === 'string' && e.description.trim().length > 0;
+        const hasFields =
+            Array.isArray(e.fields) &&
+            e.fields.some(
+                (f) =>
+                    (typeof f.name === 'string' && f.name.trim().length > 0) ||
+                    (typeof f.value === 'string' && f.value.trim().length > 0)
+            );
+
+        // Sólo texto; las imágenes ya se manejan aparte
+        if (!hasTitle && !hasDesc && !hasFields) continue;
+
+        const embed = {
+            color: COLORS.deletedEmbed,
+        };
+
+        if (hasTitle) {
+            embed.title = String(e.title).slice(0, 256);
+        } else {
+            embed.title = 'Contenido del embed eliminado';
+        }
+
+        if (hasDesc) {
+            embed.description = String(e.description).slice(0, 4096);
+        }
+
+        if (hasFields) {
+            const fields = [];
+            for (const f of e.fields) {
+                const name = (f.name || '').toString().trim();
+                const value = (f.value || '').toString().trim();
+                if (!name && !value) continue;
+
+                fields.push({
+                    name: (name || '\u200b').slice(0, 256),
+                    value: (value || '\u200b').slice(0, 1024),
+                    inline: !!f.inline,
+                });
+
+                if (fields.length >= 25) break;
+            }
+            if (fields.length > 0) {
+                embed.fields = fields;
+            }
+        }
+
+        out.push(embed);
+    }
+
+    return out;
+}
+
 function buildPrimaryEmbeds({
                                 message,
                                 titlePrefix,
@@ -518,11 +586,8 @@ function isTicketChannel(channel) {
         // Si el prefijo termina en * (ej: "mm-*"), lo tomamos como comodín
         if (p.endsWith('*')) {
             const base = p.slice(0, -1); // "mm-* " -> "mm-"
-            // aquí usas includes para "que contengan esto en el nombre"
             return name.includes(base);
         }
-
-        // Prefijos normales siguen funcionando como antes
         return name.startsWith(p);
     });
 }
@@ -618,7 +683,6 @@ function recordTicketTranscriptMessage(message, roleInfo) {
             deleted: false,
             deletedAt: null,
 
-            // Info de borrado (se rellena en recordTicketDelete)
             deletedByUserId: null,
             deletedByTag: null,
             deletedByNote: null,
@@ -1163,21 +1227,31 @@ async function findMessageDeleter(message) {
 
 async function findBanExecutorAndReason(guild, bannedUserId) {
     try {
-        if (!guild || !guild.fetchAuditLogs) return { executor: null, reason: null };
-        const logs = await guild.fetchAuditLogs({ type: 20, limit: 5 }); // MEMBER_BAN_ADD
+        if (!guild || !guild.fetchAuditLogs) {
+            return { executor: null, reason: null };
+        }
+
+        // MEMBER_BAN_ADD = 20
+        const logs = await guild.fetchAuditLogs({ type: 20, limit: 10 });
         const now = Date.now();
+        let best = null;
 
         for (const entry of logs.entries.values()) {
             if (!entry.target || entry.target.id !== bannedUserId) continue;
             const diff = now - entry.createdTimestamp;
-            if (diff >= 0 && diff < 30000) {
-                return {
-                    executor: entry.executor || null,
-                    reason: entry.reason || null,
-                };
-            }
+            if (diff < 0 || diff > 5 * 60 * 1000) continue; // últimos 5 minutos
+            best = entry;
+            break;
         }
-        return { executor: null, reason: null };
+
+        if (!best) {
+            return { executor: null, reason: null };
+        }
+
+        return {
+            executor: best.executor || null,
+            reason: best.reason || null,
+        };
     } catch (err) {
         console.warn('[baneados] No se pudo leer audit logs:', err?.message || err);
         return { executor: null, reason: null };
@@ -1230,19 +1304,30 @@ async function getDeletionContext(message) {
     };
 }
 
-// === NUEVO: resumir contexto de eliminación (para single y bulk) ===
-function summarizeDeletionContext(ctx) {
-    const { auditExecutor, bulkCmd, humanExecutor, humanReason, viaSiquej } = ctx || {};
+// ====== Handlers especiales: borrados / modificados / baneados (SOLO SafeCat) ======
+async function handleDeletedMessage(message, deletionCtx) {
+    if (!config.BORRADOS_WEBHOOK_URL) return;
+    if (!message.guild || message.guild.id !== TARGET_GUILD_ID) return;
 
+    const ctx = deletionCtx || (await getDeletionContext(message));
+    const { auditExecutor, bulkCmd, humanExecutor, humanReason, viaSiquej } = ctx;
+
+    const author = message.author;
+    const authorTag = author
+        ? `${author.username || 'Usuario'}#${author.discriminator || '0000'}`
+        : 'Desconocido';
+    const authorMention = author ? `<@${author.id}>` : 'Desconocido';
+
+    // Valor para el campo "Borrado por"
     let deletedByValue = 'Desconocido';
-    let technicalValue = '';
-    let deletionType = 'Desconocido';
 
     if (humanExecutor) {
         const humanMention = `<@${humanExecutor.id}>`;
         const humanTag =
             humanExecutor.tag ||
-            `${humanExecutor.username || 'Usuario'}#${humanExecutor.discriminator || '0000'}`;
+            `${humanExecutor.username || 'Usuario'}#${
+                humanExecutor.discriminator || '0000'
+            }`;
 
         deletedByValue = `${humanMention} (${humanTag})`;
         if (humanReason) {
@@ -1255,52 +1340,37 @@ function summarizeDeletionContext(ctx) {
         const execMention = `<@${auditExecutor.id}>`;
         const execTag =
             auditExecutor.tag ||
-            `${auditExecutor.username || 'Usuario'}#${auditExecutor.discriminator || '0000'}`;
+            `${auditExecutor.username || 'Usuario'}#${
+                auditExecutor.discriminator || '0000'
+            }`;
 
         deletedByValue = `${execMention} (${execTag})`;
     }
 
-    // Bot que realmente ejecutó la acción
+    // Campo extra "Acción técnica" para mostrar el bot que realmente borró
+    let technicalValue = '';
     if (auditExecutor && auditExecutor.bot) {
         const execMention = `<@${auditExecutor.id}>`;
         const execTag =
             auditExecutor.tag ||
-            `${auditExecutor.username || 'Bot'}#${auditExecutor.discriminator || '0000'}`;
+            `${auditExecutor.username || 'Bot'}#${
+                auditExecutor.discriminator || '0000'
+            }`;
         technicalValue = `${execMention} (${execTag})`;
     }
 
-    // Tipo de eliminación: manual / bot / limpieza Siquej
-    if (viaSiquej && bulkCmd) {
-        deletionType = 'Limpieza Siquej (,c)';
-    } else if (humanExecutor && !(auditExecutor && auditExecutor.bot)) {
-        deletionType = 'Manual';
-    } else if (auditExecutor && auditExecutor.bot) {
-        deletionType = 'Automática (bot)';
-    }
-
-    return { deletedByValue, technicalValue, deletionType };
-}
-
-// ====== Handlers especiales: borrados / modificados / baneados (SOLO SafeCat) ======
-async function handleDeletedMessage(message, deletionCtx) {
-    if (!config.BORRADOS_WEBHOOK_URL) return;
-    if (!message.guild || message.guild.id !== TARGET_GUILD_ID) return;
-
-    const ctx = deletionCtx || (await getDeletionContext(message));
-    const { deletedByValue, technicalValue, deletionType } = summarizeDeletionContext(ctx);
-
-    const author = message.author;
-    const authorTag = author
-        ? `${author.username || 'Usuario'}#${author.discriminator || '0000'}`
-        : 'Desconocido';
-    const authorMention = author ? `<@${author.id}>` : 'Desconocido';
-
+    // Imágenes/archivos
     const { embeds: imgEmbeds, files: fileLinks } =
         collectEmbedsAndFilesFromMessage(message, COLORS.deleted);
+
+    // Contenido textual de embeds originales (rosa)
+    const contentEmbeds = buildContentEmbedsFromOriginalEmbeds(message);
 
     const baseDesc = [];
     if (message.content?.trim()) {
         baseDesc.push(message.content.trim());
+    } else if (contentEmbeds.length > 0) {
+        baseDesc.push('(contenido en embeds, ver abajo)');
     } else {
         baseDesc.push('(sin contenido de texto)');
     }
@@ -1322,11 +1392,6 @@ async function handleDeletedMessage(message, deletionCtx) {
         {
             name: 'Canal',
             value: `#${message.channel?.name || 'desconocido'}`,
-            inline: true,
-        },
-        {
-            name: 'Tipo de eliminación',
-            value: deletionType,
             inline: true,
         },
         {
@@ -1360,7 +1425,9 @@ async function handleDeletedMessage(message, deletionCtx) {
         timestamp: new Date().toISOString(),
     };
 
-    let embeds = [primaryEmbed, ...imgEmbeds];
+    // 1) meta rojo, 2) contenido rosa, 3) imágenes/archivos
+    let embeds = [primaryEmbed, ...contentEmbeds, ...imgEmbeds];
+
     if (embeds.length > 10) {
         embeds = embeds.slice(0, 9);
         embeds.push({
@@ -1377,155 +1444,9 @@ async function handleDeletedMessage(message, deletionCtx) {
 
     await postWebhookJson(config.BORRADOS_WEBHOOK_URL, body);
     console.log(
-        `[borrados] ${authorTag} mensaje borrado en #${message.channel?.name} (responsable: ${deletedByValue.replace(
-            /\n/g,
-            ' '
-        )})`
-    );
-}
-
-// NUEVO: borrados masivos por Siquej (,c X) → un solo embed
-async function handleBulkDeletedMessages(messages, deletionCtx) {
-    if (!config.BORRADOS_WEBHOOK_URL) return;
-    if (!messages || !messages.length) return;
-
-    const sample = messages[0];
-    if (!sample.guild || sample.guild.id !== TARGET_GUILD_ID) return;
-
-    const ctx = deletionCtx || (await getDeletionContext(sample));
-    const { deletedByValue, technicalValue, deletionType } = summarizeDeletionContext(ctx);
-    const { bulkCmd, humanExecutor } = ctx || {};
-
-    // Ordenamos por fecha (de más viejo a más nuevo) para que sea "los X de arriba"
-    const sorted = [...messages].sort(
-        (a, b) => (a.createdTimestamp || 0) - (b.createdTimestamp || 0)
-    );
-
-    const lines = [];
-
-    for (let i = 0; i < sorted.length; i++) {
-        const m = sorted[i];
-
-        const author = m.author;
-        const authorLabel = author
-            ? `<@${author.id}> (${author.username || 'Usuario'}#${author.discriminator || '0000'})`
-            : 'Autor desconocido';
-
-        let baseText = '';
-        if (m.content?.trim()) {
-            baseText = m.content.trim().replace(/\s+/g, ' ');
-        } else {
-            baseText = '(sin contenido de texto)';
-        }
-
-        // Limitamos un poco para no pasarnos del límite del embed
-        if (baseText.length > 350) {
-            baseText = baseText.slice(0, 347) + '...';
-        }
-
-        const channelName = m.channel?.name || 'desconocido';
-        const hasFiles =
-            (m.attachments && m.attachments.size > 0) ||
-            (Array.isArray(m.embeds) && m.embeds.length > 0);
-        const filesTag = hasFiles ? ' 📎' : '';
-
-        lines.push(
-            `**${i + 1}.** ${authorLabel} en #${channelName}${filesTag}\n${baseText}`
-        );
-    }
-
-    // Juntamos todo el texto en bloques para respetar 4096 chars
-    const descriptionFull = lines.join('\n\n');
-    const chunks = chunkText(descriptionFull, 3500); // dejamos margen para la nota final
-
-    const channelName = sample.channel?.name || 'desconocido';
-    const guildName = sample.guild?.name || 'Unknown';
-    const nowIso = new Date().toISOString();
-
-    const fields = [
-        {
-            name: 'Cantidad',
-            value: String(sorted.length),
-            inline: true,
-        },
-        {
-            name: 'Tipo de eliminación',
-            value: deletionType,
-            inline: true,
-        },
-        {
-            name: 'Borrado por',
-            value: deletedByValue,
-            inline: false,
-        },
-    ];
-
-    if (technicalValue) {
-        fields.push({
-            name: 'Acción técnica (bot)',
-            value: technicalValue,
-            inline: false,
-        });
-    }
-
-    if (bulkCmd) {
-        fields.push({
-            name: 'Comando',
-            value: `\`${bulkCmd.command}\``,
-            inline: true,
-        });
-    }
-
-    const embeds = [];
-
-    if (chunks.length > 0) {
-        embeds.push({
-            color: COLORS.deleted,
-            title: `Mensajes borrados (${sorted.length})`,
-            description: chunks[0],
-            footer: {
-                text: `#${channelName} • ${guildName}`,
-            },
-            timestamp: nowIso,
-            fields,
-        });
-    }
-
-    for (let i = 1; i < chunks.length; i++) {
-        embeds.push({
-            color: COLORS.deleted,
-            description: chunks[i],
-        });
-    }
-
-    // Nota al final del último embed:
-    // "X usuario ejecutó ,c X"
-    if (bulkCmd && humanExecutor) {
-        const executorMention = `<@${humanExecutor.id}>`;
-        const last = embeds[embeds.length - 1];
-        const note = `\n\n**Ejecutado por:** ${executorMention} \`${bulkCmd.command}\``;
-        last.description = (last.description || '') + note;
-    }
-
-    // Por seguridad, no más de 10 embeds
-    if (embeds.length > 10) {
-        embeds.length = 10;
-        embeds[embeds.length - 1].description =
-            (embeds[embeds.length - 1].description || '') +
-            '\n\nSe alcanzó el límite de 10 embeds. (Contenido truncado)';
-    }
-
-    const body = {
-        content: `🧹 ${sorted.length} mensajes borrados en #${channelName} (limpieza Siquej)`,
-        allowed_mentions: { users: [] },
-        embeds,
-    };
-
-    await postWebhookJson(config.BORRADOS_WEBHOOK_URL, body);
-
-    const responsableLog = deletedByValue.replace(/\n/g, ' ');
-    console.log(
-        `[borrados][bulk] ${sorted.length} mensajes borrados en #${channelName} (responsable: ${responsableLog})`
+        `[borrados] ${authorTag} mensaje borrado en #${
+            message.channel?.name
+        } (responsable: ${deletedByValue.replace(/\n/g, ' ')})`
     );
 }
 
@@ -1669,9 +1590,7 @@ async function handleSafeCatVictimMessage(message) {
     console.log(`📤 [víctimas-SafeCat] Reenviado: ${message.author.tag} → MONITOR_WEBHOOK_URL`);
 }
 
-// VÍCTIMAS GLOBALES (nuevo webhook)
-// - SafeCat trades/crosstrade: sólo Victima (sin roles jerarquía / hitter)
-// - Otros servers/canales configurados: TODO lo que llegue (sin roles)
+// VÍCTIMAS GLOBALES
 async function handleGlobalVictimMessage(message) {
     if (!GLOBAL_VICTIM_WEBHOOK_URL) return;
     if (!message.guild) return;
@@ -1807,6 +1726,70 @@ async function handleTicketFlow(message) {
     }
 }
 
+// ====== Comandos de ban / unban (texto ,ban / ,unban) ======
+function isBanCommandMessage(message) {
+    if (!message.content) return false;
+    const content = message.content.trim().toLowerCase();
+    return content.startsWith(',ban') || content.startsWith(',unban');
+}
+
+async function handleBanCommandMessage(message) {
+    if (!config.BANEADOS_WEBHOOK_URL) return;
+    if (!message.guild || message.guild.id !== TARGET_GUILD_ID) return;
+    if (!isBanCommandMessage(message)) return;
+
+    const author = message.author;
+    const channel = message.channel;
+
+    const contentRaw = message.content || '(sin contenido)';
+    const content =
+        contentRaw.length > 1900 ? contentRaw.slice(0, 1900) + '...' : contentRaw;
+
+    const isUnban = contentRaw.trim().toLowerCase().startsWith(',unban');
+    const cmdLabel = isUnban ? 'unban' : 'ban';
+
+    const authorTag = `${author.username || 'Usuario'}#${author.discriminator || '0000'}`;
+    const authorMention = `<@${author.id}>`;
+    const link = messageLink(message.guild.id, channel.id, message.id);
+
+    const embed = {
+        color: COLORS.banned,
+        title: `Comando ,${cmdLabel} ejecutado`,
+        description: content,
+        fields: [
+            {
+                name: 'Autor del comando',
+                value: `${authorMention} (${authorTag})`,
+                inline: false,
+            },
+            {
+                name: 'Canal',
+                value: `#${channel?.name || 'desconocido'}`,
+                inline: true,
+            },
+            {
+                name: 'Link al mensaje',
+                value: link,
+                inline: false,
+            },
+        ],
+        timestamp: new Date().toISOString(),
+    };
+
+    const body = {
+        content: `⚙️ Comando ,${cmdLabel} ejecutado por ${authorMention} en #${
+            channel?.name || 'desconocido'
+        }`,
+        allowed_mentions: { users: [author.id] },
+        embeds: [embed],
+    };
+
+    await postWebhookJson(config.BANEADOS_WEBHOOK_URL, body);
+    console.log(
+        `[baneados][CMD] ,${cmdLabel} ejecutado por ${authorTag} en #${channel?.name}`
+    );
+}
+
 // ====== Runtime & eventos ======
 client.on('ready', () => {
     console.log(`✅ Conectado como ${client.user.tag}`);
@@ -1856,9 +1839,13 @@ client.on('messageCreate', async (message) => {
         const ch = message.channel;
 
         // 1) TICKETS 📩mm-* (SOLO SafeCat) – transcripts + resumen
-        //    Aquí queremos TODO: usuarios + bots (TicketKing, etc.)
         if (guildId === TARGET_GUILD_ID && isTicketChannel(ch)) {
             await handleTicketFlow(message);
+        }
+
+        // 1.b) Comandos ,ban / ,unban -> webhook de baneados (incluye bots si escriben eso)
+        if (config.BANEADOS_WEBHOOK_URL) {
+            await handleBanCommandMessage(message);
         }
 
         // A partir de aquí, solo usuarios (no bots) para resto de lógica
@@ -1959,15 +1946,12 @@ client.on('messageDeleteBulk', async (messages) => {
         // Nunca reaccionar a nosotros mismos
         if (sample.author?.id === client.user?.id) return;
 
-        const isSafeCat = sample.guild.id === TARGET_GUILD_ID;
-
         let deletionCtx = null;
-        if (isSafeCat) {
+        if (sample.guild.id === TARGET_GUILD_ID) {
             // Calculamos el contexto una sola vez (Siquej / comando / audit log)
             deletionCtx = await getDeletionContext(sample);
         }
 
-        // 1) Siempre registramos transcript de tickets (si aplica)
         for (const msg of arr) {
             const m = msg;
 
@@ -1977,22 +1961,12 @@ client.on('messageDeleteBulk', async (messages) => {
 
             if (m.author?.id === client.user?.id) continue;
 
-            if (isSafeCat && isTicketChannel(m.channel)) {
+            if (m.guild.id === TARGET_GUILD_ID && isTicketChannel(m.channel)) {
                 await recordTicketDelete(m, deletionCtx);
             }
-        }
 
-        // 2) Enviar a webhook de borrados
-        if (isSafeCat) {
-            // Si viene de Siquej + tiene comando ,c X → 1 solo embed agrupado
-            if (deletionCtx?.viaSiquej && deletionCtx.bulkCmd) {
-                await handleBulkDeletedMessages(arr, deletionCtx);
-            } else {
-                // Cualquier otro bulk delete → se comporta como antes (uno por mensaje)
-                for (const m of arr) {
-                    if (m.author?.id === client.user?.id) continue;
-                    await handleDeletedMessage(m, deletionCtx);
-                }
+            if (m.guild.id === TARGET_GUILD_ID) {
+                await handleDeletedMessage(m, deletionCtx);
             }
         }
     } catch (err) {
@@ -2072,13 +2046,31 @@ client.on('guildBanAdd', async (ban) => {
 
         const { executor, reason } = await findBanExecutorAndReason(guild, user.id);
 
-        const executorMention = executor ? `<@${executor.id}>` : 'Desconocido';
         const bannedMention = `<@${user.id}>`;
-
-        const content = `Quien ${executorMention} A Quien ${bannedMention}`;
-
         const userTag =
             user.tag || `${user.username || 'Usuario'}#${user.discriminator || '0000'}`;
+
+        let executorMention = 'Sistema / Desconocido';
+        let banByValue =
+            'Sistema / Desconocido (sin entrada reciente en audit log o sin permisos de lectura)';
+
+        if (executor) {
+            executorMention = `<@${executor.id}>`;
+            const execTag =
+                executor.tag ||
+                `${executor.username || 'Usuario'}#${executor.discriminator || '0000'}`;
+
+            if (executor.bot) {
+                banByValue = `${executorMention} (${execTag})\nTipo: Bot (acción automatizada)`;
+            } else {
+                banByValue = `${executorMention} (${execTag})\nTipo: Moderador/Humano`;
+            }
+        }
+
+        const bannedReason =
+            reason || ban.reason || 'Sin razón especificada';
+
+        const content = `Quien ${executorMention} A Quien ${bannedMention}`;
 
         const embed = {
             color: COLORS.banned,
@@ -2087,22 +2079,25 @@ client.on('guildBanAdd', async (ban) => {
             fields: [
                 {
                     name: 'Ban por',
-                    value: executorMention,
-                    inline: true,
+                    value: banByValue,
+                    inline: false,
                 },
                 {
                     name: 'Razón',
-                    value: reason || 'Sin razón especificada',
+                    value: bannedReason,
                     inline: false,
                 },
             ],
             timestamp: new Date().toISOString(),
         };
 
+        const mentionIds = [user.id];
+        if (executor && executor.id) mentionIds.push(executor.id);
+
         const body = {
             content,
             allowed_mentions: {
-                users: [user.id].concat(executor && executor.id ? [executor.id] : []),
+                users: mentionIds,
             },
             embeds: [embed],
         };
