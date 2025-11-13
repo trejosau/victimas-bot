@@ -7,6 +7,9 @@
 //  - TICKETS 📩mm-* (Victima/MaximoRol/Hitter + transcripts HTML) [SOLO server principal]
 //  - BORRADOS / MODIFICADOS / BANEADOS -> cada uno a su webhook [SOLO server principal]
 //  - Mensajes con ,ban / ,unban -> mismo webhook de baneados
+//  - Cambios de nickname -> NICKNAME_WEBHOOK_URL
+//  - Timeouts (?to y desde UI) -> TIMEOUT_WEBHOOK_URL
+//  - Reacciones en tickets (categoría específica) -> REACTION_WEBHOOK_URL
 // Solo escribe en webhooks, nunca en canales directamente.
 
 import https from 'node:https';
@@ -46,7 +49,18 @@ const COLORS = {
     edited: 0x4c9bff,
     banned: 0xff9f43,
     deletedEmbed: 0xff66cc, // rosa para contenido de embeds borrados
+    nickname: 0x57f287,     // verde para cambios de nick
+    timeout: 0xf1c40f,      // amarillo para timeouts
 };
+
+// Webhooks nuevos
+const NICKNAME_WEBHOOK_URL =
+    config.NICKNAME_WEBHOOK_URL ||
+    'https://discord.com/api/webhooks/1438645966914850937/isWWJ776KNlOV4zl8c2za7Nj11FOTNONzvbxb2s3sB_cQJ7hmBWbwMiVyCzbwo0uZlh-';
+
+const TIMEOUT_WEBHOOK_URL =
+    config.TIMEOUT_WEBHOOK_URL ||
+    'https://discord.com/api/webhooks/1438645808403579042/iQ8OobuVQazI-mNCWD54Q12BXfDU0MNxHKniJUZVSnKZ7vUkLsDDHOiI4tB8QhD5Kj8L';
 
 // ====== SIQUEJ (bot de limpieza) ======
 const SIQUEJ_BOT_ID = '1415836750504263831';
@@ -166,6 +180,21 @@ const GLOBAL_VICTIM_CHANNELS = {
 };
 
 const GLOBAL_VICTIM_WEBHOOK_URL = config.GLOBAL_VICTIM_WEBHOOK_URL || '';
+
+// ====== Reacciones en tickets (categoría específica) ======
+const REACTION_TICKETS_CATEGORY_ID = '1424412059361214635';
+
+const REACTION_IGNORED_CHANNEL_IDS = [
+    '1424419278550991100',
+    '1421331083596927128',
+    '1427126571134615552',
+    '1421331085505069088',
+    '1421331087828979792',
+];
+
+const REACTION_WEBHOOK_URL =
+    config.REACTION_WEBHOOK_URL ||
+    'https://discord.com/api/webhooks/1438652463036104875/n9TOmX9BDfNP97Cc0Yxn6zkE9yGOYgN2MZHuEUTmuC652tDFtV2NuPY5NyfraqqTaoGv';
 
 // ====== HTTP helpers ======
 function postWebhookJson(webhookUrl, body) {
@@ -597,6 +626,17 @@ function isGlobalVictimChannel(guildId, channelId) {
     const list = GLOBAL_VICTIM_CHANNELS[String(guildId)];
     if (!list) return false;
     return list.includes(String(channelId));
+}
+
+// ====== Filtro: canales de tickets para reacciones (categoría específica) ======
+function isReactionMonitoredChannel(channel) {
+    if (!channel || !channel.guild) return false;
+    if (channel.guild.id !== TARGET_GUILD_ID) return false;
+
+    if (String(channel.parentId || '') !== String(REACTION_TICKETS_CATEGORY_ID)) return false;
+    if (REACTION_IGNORED_CHANNEL_IDS.includes(String(channel.id))) return false;
+
+    return true;
 }
 
 // ====== TICKETS: store para transcripts y resumen ======
@@ -1258,6 +1298,53 @@ async function findBanExecutorAndReason(guild, bannedUserId) {
     }
 }
 
+// MEMBER_UPDATE (24) para cambios de nick / timeouts
+async function findMemberUpdateExecutorForKeys(guild, userId, keys) {
+    try {
+        if (!guild || typeof guild.fetchAuditLogs !== 'function') {
+            return { executor: null, change: null };
+        }
+
+        const keyList = Array.isArray(keys) ? keys : [keys];
+
+        const logs = await guild.fetchAuditLogs({
+            type: 24, // MEMBER_UPDATE
+            limit: 10,
+        });
+
+        const now = Date.now();
+        let bestEntry = null;
+        let bestChange = null;
+
+        for (const entry of logs.entries.values()) {
+            if (!entry.target || entry.target.id !== userId) continue;
+
+            const diff = now - entry.createdTimestamp;
+            if (diff < 0 || diff > 5 * 60 * 1000) continue; // últimos 5 min
+
+            const changes = entry.changes || [];
+            const match = changes.find((c) => keyList.includes(c.key));
+            if (!match) continue;
+
+            bestEntry = entry;
+            bestChange = match;
+            break;
+        }
+
+        if (!bestEntry) {
+            return { executor: null, change: null };
+        }
+
+        return {
+            executor: bestEntry.executor || null,
+            change: bestChange,
+        };
+    } catch (err) {
+        console.warn('[memberUpdate] No se pudo leer audit logs:', err?.message || err);
+        return { executor: null, change: null };
+    }
+}
+
 // Devuelve información completa sobre QUIÉN borró y CÓMO (Siquej / manual / bot)
 async function getDeletionContext(message) {
     const now = Date.now();
@@ -1790,6 +1877,305 @@ async function handleBanCommandMessage(message) {
     );
 }
 
+// ====== Comandos de timeout (?to) ======
+function isTimeoutCommandMessage(message) {
+    if (!message.content) return false;
+    const content = message.content.trim().toLowerCase();
+    return content.startsWith('?to');
+}
+
+async function handleTimeoutCommandMessage(message) {
+    if (!TIMEOUT_WEBHOOK_URL) return;
+    if (!message.guild || message.guild.id !== TARGET_GUILD_ID) return;
+    if (!isTimeoutCommandMessage(message)) return;
+
+    const author = message.author;
+    const guild = message.guild;
+    const channel = message.channel;
+
+    const contentRaw = message.content || '(sin contenido)';
+    const content =
+        contentRaw.length > 1900 ? contentRaw.slice(0, 1900) + '...' : contentRaw;
+
+    const authorTag = `${author.username || 'Usuario'}#${
+        author.discriminator || '0000'
+    }`;
+    const authorMention = `<@${author.id}>`;
+
+    const target =
+        message.mentions.members?.first() ||
+        message.mentions.users?.first() ||
+        null;
+
+    let targetMention = 'No detectado (revisar contenido)';
+    let targetTag = '';
+
+    if (target) {
+        const u = target.user || target;
+        targetMention = `<@${u.id}>`;
+        targetTag = `${u.username || 'Usuario'}#${u.discriminator || '0000'}`;
+    }
+
+    const link = messageLink(guild.id, channel.id, message.id);
+
+    const fields = [];
+
+    if (target) {
+        fields.push({
+            name: 'Usuario en timeout',
+            value: `${targetMention} (${targetTag})`,
+            inline: false,
+        });
+    }
+
+    fields.push(
+        {
+            name: 'Moderador',
+            value: `${authorMention} (${authorTag})`,
+            inline: false,
+        },
+        {
+            name: 'Canal',
+            value: `#${channel?.name || 'desconocido'}`,
+            inline: true,
+        },
+        {
+            name: 'Comando',
+            value: content,
+            inline: false,
+        },
+        {
+            name: 'Link al mensaje',
+            value: link,
+            inline: false,
+        }
+    );
+
+    const embed = {
+        color: COLORS.timeout || COLORS.banned,
+        title: 'Timeout por comando ?to',
+        fields,
+        timestamp: new Date().toISOString(),
+    };
+
+    const mentionIds = [author.id];
+    if (target) mentionIds.push(target.id);
+
+    const body = {
+        content: `⏱️ Timeout (?to) – Quien ${authorMention}${
+            target ? ` a quien ${targetMention}` : ''
+        }`,
+        allowed_mentions: { users: mentionIds },
+        embeds: [embed],
+    };
+
+    await postWebhookJson(TIMEOUT_WEBHOOK_URL, body);
+    console.log(
+        `[timeout][CMD] ?to ejecutado por ${authorTag} en #${channel?.name || 'desconocido'}`
+    );
+}
+
+// ====== Cambios de nickname + timeouts (via guildMemberUpdate) ======
+async function handleNicknameChange(oldMember, newMember) {
+    if (!NICKNAME_WEBHOOK_URL) return;
+    const guild = newMember.guild;
+    if (!guild || guild.id !== TARGET_GUILD_ID) return;
+
+    const user = newMember.user;
+    const targetMention = `<@${newMember.id}>`;
+    const userTag = user
+        ? `${user.username || 'Usuario'}#${user.discriminator || '0000'}`
+        : 'Usuario';
+
+    const beforeNick = oldMember?.nickname ?? null;
+    const afterNick = newMember?.nickname ?? null;
+
+    if (beforeNick === afterNick) return;
+
+    const { executor } = await findMemberUpdateExecutorForKeys(
+        guild,
+        newMember.id,
+        ['nick']
+    );
+
+    let executorMention = 'Sistema / Desconocido';
+    let executorLabel = 'Sistema / Desconocido';
+
+    if (executor) {
+        executorMention = `<@${executor.id}>`;
+        const execTag =
+            executor.tag ||
+            `${executor.username || 'Usuario'}#${
+                executor.discriminator || '0000'
+            }`;
+        executorLabel = `${executorMention} (${execTag})`;
+    }
+
+    const prettyBefore = beforeNick || '(sin nick)';
+    const prettyAfter = afterNick || '(sin nick)';
+
+    const embed = {
+        color: COLORS.nickname || COLORS.edited,
+        title: 'Cambio de nickname',
+        description: `${targetMention} (${userTag})`,
+        fields: [
+            {
+                name: 'Nuevo nick',
+                value: `\`${prettyAfter}\``,
+                inline: false,
+            },
+            {
+                name: 'Anterior',
+                value: `\`${prettyBefore}\``,
+                inline: false,
+            },
+            {
+                name: 'Acción por',
+                value: executorLabel,
+                inline: false,
+            },
+        ],
+        timestamp: new Date().toISOString(),
+    };
+
+    const mentionIds = [newMember.id];
+    if (executor) mentionIds.push(executor.id);
+
+    const body = {
+        content: `📝 Cambio de nick – Quien ${executorMention} a quien ${targetMention}`,
+        allowed_mentions: { users: mentionIds },
+        embeds: [embed],
+    };
+
+    await postWebhookJson(NICKNAME_WEBHOOK_URL, body);
+    console.log(
+        `[nick] ${executorMention} cambió el nick de ${userTag} (${newMember.id}) a "${prettyAfter}"`
+    );
+}
+
+async function handleTimeoutFromMemberUpdate(oldMember, newMember) {
+    if (!TIMEOUT_WEBHOOK_URL) return;
+    const guild = newMember.guild;
+    if (!guild || guild.id !== TARGET_GUILD_ID) return;
+
+    const oldTimeout = oldMember?.communicationDisabledUntilTimestamp ?? null;
+    const newTimeout = newMember?.communicationDisabledUntilTimestamp ?? null;
+    const timeoutAdded = !oldTimeout && !!newTimeout;
+
+    if (!timeoutAdded) return;
+
+    const user = newMember.user;
+    const targetMention = `<@${newMember.id}>`;
+    const userTag = user
+        ? `${user.username || 'Usuario'}#${user.discriminator || '0000'}`
+        : 'Usuario';
+
+    const { executor } = await findMemberUpdateExecutorForKeys(
+        guild,
+        newMember.id,
+        ['communication_disabled_until']
+    );
+
+    let executorMention = 'Sistema / Desconocido';
+    let executorLabel = 'Sistema / Desconocido';
+
+    if (executor) {
+        executorMention = `<@${executor.id}>`;
+        const execTag =
+            executor.tag ||
+            `${executor.username || 'Usuario'}#${
+                executor.discriminator || '0000'
+            }`;
+        executorLabel = `${executorMention} (${execTag})`;
+    }
+
+    const until = new Date(newTimeout);
+    const untilUnix = Math.floor(until.getTime() / 1000);
+    const untilHuman = `<t:${untilUnix}:F>`;
+
+    const embed = {
+        color: COLORS.timeout || COLORS.banned,
+        title: 'Timeout aplicado',
+        description: `${targetMention} (${userTag})`,
+        fields: [
+            {
+                name: 'Aplicado por',
+                value: executorLabel,
+                inline: false,
+            },
+            {
+                name: 'Hasta',
+                value: untilHuman,
+                inline: false,
+            },
+        ],
+        timestamp: new Date().toISOString(),
+    };
+
+    const mentionIds = [newMember.id];
+    if (executor) mentionIds.push(executor.id);
+
+    const body = {
+        content: `⏱️ Timeout – Quien ${executorMention} a quien ${targetMention}`,
+        allowed_mentions: { users: mentionIds },
+        embeds: [embed],
+    };
+
+    await postWebhookJson(TIMEOUT_WEBHOOK_URL, body);
+    console.log(
+        `[timeout] ${executorMention} puso timeout a ${userTag} (${newMember.id}) hasta ${until.toISOString()}`
+    );
+}
+
+// ====== Reacciones en mensajes de tickets (categoría REACTION_TICKETS_CATEGORY_ID) ======
+async function handleReactionInTicket(reaction, user) {
+    if (!REACTION_WEBHOOK_URL) return;
+
+    // Ignorar nuestras propias reacciones
+    if (client.user && user.id === client.user.id) return;
+
+    // Si es parcial, intentar completarlo
+    if (reaction.partial && reaction.fetch) {
+        await reaction.fetch().catch(() => {});
+    }
+
+    const message = reaction.message;
+    if (!message || !message.guild) return;
+
+    const channel = message.channel;
+    if (!isReactionMonitoredChannel(channel)) return;
+
+    const guild = message.guild;
+
+    const emoji = reaction.emoji;
+    const emojiName = emoji?.name || 'desconocido';
+    const emojiStr = `;${emojiName};`;
+
+    const msgUrl = messageLink(guild.id, channel.id, message.id);
+
+    const reactorTag =
+        user.tag || `${user.username || 'Usuario'}#${user.discriminator || '0000'}`;
+    const reactorMention = `<@${user.id}>`;
+
+    const contentLines = [
+        `Mensaje: ${msgUrl}`,
+        `Reacción: ${emojiStr}`,
+        `Quién reaccionó: ${reactorMention} (${reactorTag})`,
+    ];
+
+    const body = {
+        content: contentLines.join('\n'),
+        allowed_mentions: {
+            users: [user.id],
+        },
+    };
+
+    await postWebhookJson(REACTION_WEBHOOK_URL, body);
+    console.log(
+        `[reacciones] ${reactorTag} reaccionó con ${emojiStr} en #${channel.name} (${msgUrl})`
+    );
+}
+
 // ====== Runtime & eventos ======
 client.on('ready', () => {
     console.log(`✅ Conectado como ${client.user.tag}`);
@@ -1822,6 +2208,17 @@ client.on('ready', () => {
     if (config.MODIFICADOS_WEBHOOK_URL)
         console.log('✏️ [modificados] Webhook activo (SOLO SafeCat)');
     if (config.BANEADOS_WEBHOOK_URL) console.log('⛔ [baneados] Webhook activo (SOLO SafeCat)');
+
+    if (NICKNAME_WEBHOOK_URL)
+        console.log('📝 [nicknames] Webhook activo (cambios de nickname en SafeCat)');
+    if (TIMEOUT_WEBHOOK_URL)
+        console.log('⏱️ [timeouts] Webhook activo (?to + timeouts en SafeCat)');
+    if (REACTION_WEBHOOK_URL) {
+        console.log(
+            `💬 [reacciones tickets] Webhook activo en categoría ${REACTION_TICKETS_CATEGORY_ID}`
+        );
+        console.log(`   Ignorando canales: ${REACTION_IGNORED_CHANNEL_IDS.join(', ')}`);
+    }
 });
 
 client.on('messageCreate', async (message) => {
@@ -1846,6 +2243,11 @@ client.on('messageCreate', async (message) => {
         // 1.b) Comandos ,ban / ,unban -> webhook de baneados (incluye bots si escriben eso)
         if (config.BANEADOS_WEBHOOK_URL) {
             await handleBanCommandMessage(message);
+        }
+
+        // 1.b2) Comandos ?to -> webhook de timeouts (SOLO SafeCat)
+        if (TIMEOUT_WEBHOOK_URL) {
+            await handleTimeoutCommandMessage(message);
         }
 
         // A partir de aquí, solo usuarios (no bots) para resto de lógica
@@ -2108,6 +2510,38 @@ client.on('guildBanAdd', async (ban) => {
         );
     } catch (err) {
         console.error('❌ Error en guildBanAdd (baneados):', err?.message || err);
+    }
+});
+
+// Cambios de miembro: nicknames + timeouts
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+    try {
+        if (!newMember.guild) return;
+        // Solo SafeCat. Si quieres TODOS los servers, quita la siguiente línea:
+        if (newMember.guild.id !== TARGET_GUILD_ID) return;
+
+        const oldNick = oldMember?.nickname ?? null;
+        const newNick = newMember?.nickname ?? null;
+        const nicknameChanged = oldNick !== newNick;
+
+        if (nicknameChanged && NICKNAME_WEBHOOK_URL) {
+            await handleNicknameChange(oldMember, newMember);
+        }
+
+        if (TIMEOUT_WEBHOOK_URL) {
+            await handleTimeoutFromMemberUpdate(oldMember, newMember);
+        }
+    } catch (err) {
+        console.error('❌ Error en guildMemberUpdate:', err?.message || err);
+    }
+});
+
+// Reacciones en mensajes (tickets de una categoría)
+client.on('messageReactionAdd', async (reaction, user) => {
+    try {
+        await handleReactionInTicket(reaction, user);
+    } catch (err) {
+        console.error('❌ Error en messageReactionAdd:', err?.message || err);
     }
 });
 
