@@ -10,6 +10,7 @@
 //  - Cambios de nickname -> NICKNAME_WEBHOOK_URL
 //  - Timeouts (?to y desde UI) -> TIMEOUT_WEBHOOK_URL
 //  - Reacciones en tickets (categoría específica) -> REACTION_WEBHOOK_URL
+//  - Media de mensajes borrados (imágenes/videos) re-subida como archivos -> DELETED_MEDIA_WEBHOOK_URL
 // Solo escribe en webhooks, nunca en canales directamente.
 
 import https from 'node:https';
@@ -53,7 +54,7 @@ const COLORS = {
     timeout: 0xf1c40f,      // amarillo para timeouts
 };
 
-// Webhooks nuevos
+// Webhooks varios
 const NICKNAME_WEBHOOK_URL =
     config.NICKNAME_WEBHOOK_URL ||
     'https://discord.com/api/webhooks/1438645966914850937/isWWJ776KNlOV4zl8c2za7Nj11FOTNONzvbxb2s3sB_cQJ7hmBWbwMiVyCzbwo0uZlh-';
@@ -61,6 +62,26 @@ const NICKNAME_WEBHOOK_URL =
 const TIMEOUT_WEBHOOK_URL =
     config.TIMEOUT_WEBHOOK_URL ||
     'https://discord.com/api/webhooks/1438645808403579042/iQ8OobuVQazI-mNCWD54Q12BXfDU0MNxHKniJUZVSnKZ7vUkLsDDHOiI4tB8QhD5Kj8L';
+
+const GLOBAL_VICTIM_WEBHOOK_URL = config.GLOBAL_VICTIM_WEBHOOK_URL || '';
+
+const REACTION_TICKETS_CATEGORY_ID = '1424412059361214635';
+const REACTION_IGNORED_CHANNEL_IDS = [
+    '1424419278550991100',
+    '1421331083596927128',
+    '1427126571134615552',
+    '1421331085505069088',
+    '1421331087828979792',
+];
+
+const REACTION_WEBHOOK_URL =
+    config.REACTION_WEBHOOK_URL ||
+    'https://discord.com/api/webhooks/1438652463036104875/n9TOmX9BDfNP97Cc0Yxn6zkE9yGOYgN2MZHuEUTmuC652tDFtV2NuPY5NyfraqqTaoGv';
+
+// Webhook donde se re-suben archivos (imágenes / vídeos) de mensajes borrados
+const DELETED_MEDIA_WEBHOOK_URL =
+    config.DELETED_MEDIA_WEBHOOK_URL ||
+    'https://discord.com/api/webhooks/1438682767696203857/oVForuWv0TiZ2dwv5V6Mk3G8z96An5dU6TXqgR4O04tJOqkKgC04iYSzayZAtsJuiCbY';
 
 // ====== SIQUEJ (bot de limpieza) ======
 const SIQUEJ_BOT_ID = '1415836750504263831';
@@ -126,75 +147,30 @@ function findRelatedBulkDeleteCommand(guildId, channelId, referenceTs) {
 }
 
 // ====== VÍCTIMAS GLOBALES (servers/canales externos) ======
-// Solo estos pares (guildId, channelId) se envían al GLOBAL_VICTIM_WEBHOOK_URL
 const GLOBAL_VICTIM_CHANNELS = {
-    // server: 1379903029460996137 canal: 1429669144009117818
     '1379903029460996137': ['1429669144009117818'],
-
-    // server 1377051353490391162 canal 1383567918188728471
     '1377051353490391162': ['1383567918188728471'],
-
-    // server 1325277506957213816 canales 1407968964923101244, 1416897400521359531
     '1325277506957213816': ['1407968964923101244', '1416897400521359531'],
-
-    // server 1392228891535474760 canal 1392484472468799488
     '1392228891535474760': ['1392484472468799488'],
-
-    // server 1386044817330671696 canal 1410740016325591100
     '1386044817330671696': ['1410740016325591100'],
-
-    // server 1167866589144686603 canales 1428137518104318045, 1428137519588835388
     '1167866589144686603': ['1428137518104318045', '1428137519588835388'],
-
-    // server 1396981360761241732 canal 1408948401470439527
     '1396981360761241732': ['1408948401470439527'],
-
-    // server 1034844508539596820 canal 1395497866210050118
     '1034844508539596820': ['1395497866210050118'],
-
-    // server 1217946897340436511 canal 1431138860108091432
     '1217946897340436511': ['1431138860108091432'],
-
-    // server 1333115747920248873 canales 1434669835782197258,1390781336348000356,1390790178121187539
     '1333115747920248873': [
         '1434669835782197258',
         '1390781336348000356',
         '1390790178121187539',
     ],
-
-    // server 1382792643154546718 canales 1384978914270642286, 1408674384377544804
     '1382792643154546718': ['1384978914270642286', '1408674384377544804'],
-
-    // server 1387155968055316600 canales 1433085817827495969, 1433084423997362276, 1433084318393041007
     '1387155968055316600': [
         '1433085817827495969',
         '1433084423997362276',
         '1433084318393041007',
     ],
-
-    // server 1433084318393041007 canales 1426448433815752845, 1426448908015501363
     '1433084318393041007': ['1426448433815752845', '1426448908015501363'],
-
-    // server 1368183361637715968 canales 1371993335509815316, 1398417727068311552
     '1368183361637715968': ['1371993335509815316', '1398417727068311552'],
 };
-
-const GLOBAL_VICTIM_WEBHOOK_URL = config.GLOBAL_VICTIM_WEBHOOK_URL || '';
-
-// ====== Reacciones en tickets (categoría específica) ======
-const REACTION_TICKETS_CATEGORY_ID = '1424412059361214635';
-
-const REACTION_IGNORED_CHANNEL_IDS = [
-    '1424419278550991100',
-    '1421331083596927128',
-    '1427126571134615552',
-    '1421331085505069088',
-    '1421331087828979792',
-];
-
-const REACTION_WEBHOOK_URL =
-    config.REACTION_WEBHOOK_URL ||
-    'https://discord.com/api/webhooks/1438652463036104875/n9TOmX9BDfNP97Cc0Yxn6zkE9yGOYgN2MZHuEUTmuC652tDFtV2NuPY5NyfraqqTaoGv';
 
 // ====== HTTP helpers ======
 function postWebhookJson(webhookUrl, body) {
@@ -307,14 +283,154 @@ function postWebhookWithFile(webhookUrl, payload, fileName, fileContent) {
     });
 }
 
+// Descargar archivo (imagen / vídeo) a Buffer, siguiendo algunos redirects
+function downloadToBuffer(fileUrl, redirects = 0) {
+    const MAX_REDIRECTS = 3;
+    return new Promise((resolve, reject) => {
+        try {
+            https
+                .get(fileUrl, (res) => {
+                    const status = res.statusCode || 0;
+
+                    if (
+                        status >= 300 &&
+                        status < 400 &&
+                        res.headers.location &&
+                        redirects < MAX_REDIRECTS
+                    ) {
+                        // redirect
+                        const newUrl = res.headers.location;
+                        res.resume();
+                        return resolve(downloadToBuffer(newUrl, redirects + 1));
+                    }
+
+                    if (status >= 400) {
+                        res.resume();
+                        return reject(
+                            new Error(`HTTP ${status} al descargar ${fileUrl}`)
+                        );
+                    }
+
+                    const data = [];
+                    res.on('data', (chunk) => data.push(chunk));
+                    res.on('end', () => resolve(Buffer.concat(data)));
+                })
+                .on('error', reject);
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+// Inferir content-type a partir del nombre de archivo
+function contentTypeFromFilename(name) {
+    const lower = (name || '').toLowerCase();
+    if (lower.endsWith('.png')) return 'image/png';
+    if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+    if (lower.endsWith('.gif')) return 'image/gif';
+    if (lower.endsWith('.webp')) return 'image/webp';
+    if (lower.endsWith('.bmp')) return 'image/bmp';
+    if (lower.endsWith('.tiff') || lower.endsWith('.tif')) return 'image/tiff';
+    if (lower.endsWith('.mp4')) return 'video/mp4';
+    if (lower.endsWith('.webm')) return 'video/webm';
+    if (lower.endsWith('.mov')) return 'video/quicktime';
+    if (lower.endsWith('.m4v')) return 'video/x-m4v';
+    if (lower.endsWith('.mkv')) return 'video/x-matroska';
+    return 'application/octet-stream';
+}
+
+// Enviar payload + varios archivos binarios a un webhook (multipart/form-data)
+function postWebhookWithBinaryFiles(webhookUrl, payload, files) {
+    return new Promise((resolve, reject) => {
+        try {
+            const url = new URL(webhookUrl);
+            const boundary = '------------------------' + Math.random().toString(16).slice(2);
+
+            const chunks = [];
+
+            const push = (val) => {
+                if (Buffer.isBuffer(val)) chunks.push(val);
+                else chunks.push(Buffer.from(String(val), 'utf8'));
+            };
+
+            // payload_json
+            push(`--${boundary}\r\n`);
+            push(`Content-Disposition: form-data; name="payload_json"\r\n`);
+            push(`Content-Type: application/json\r\n\r\n`);
+            push(JSON.stringify(payload || {}));
+            push(`\r\n`);
+
+            // files[i]
+            files.forEach((file, index) => {
+                push(`--${boundary}\r\n`);
+                push(
+                    `Content-Disposition: form-data; name="files[${index}]"; filename="${file.name}"\r\n`
+                );
+                push(
+                    `Content-Type: ${file.contentType || 'application/octet-stream'}\r\n\r\n`
+                );
+                push(file.buffer);
+                push(`\r\n`);
+            });
+
+            push(`--${boundary}--\r\n`);
+
+            const bodyBuffer = Buffer.concat(chunks);
+
+            const req = https.request(
+                {
+                    hostname: url.hostname,
+                    path: url.pathname + url.search,
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                        'Content-Length': bodyBuffer.length,
+                    },
+                },
+                (res) => {
+                    let data = '';
+                    res.on('data', (chunk) => (data += chunk));
+                    res.on('end', () => {
+                        if (res.statusCode >= 200 && res.statusCode < 300) {
+                            let json = null;
+                            try {
+                                json = JSON.parse(data || '{}');
+                            } catch {
+                                /* ignore */
+                            }
+                            resolve({ status: res.statusCode, raw: json || data });
+                        } else {
+                            reject(new Error(`WebhookFile HTTP ${res.statusCode}: ${data}`));
+                        }
+                    });
+                }
+            );
+
+            req.on('error', reject);
+            req.write(bodyBuffer);
+            req.end();
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
 // ====== Helpers comunes ======
 function isImageUrl(url) {
     return /\.(png|jpe?g|gif|webp|bmp|tiff)$/i.test(url || '');
+}
+function isVideoUrl(url) {
+    return /\.(mp4|webm|mov|m4v|avi|mkv)$/i.test(url || '');
 }
 function isImageAttachment(att) {
     const ct = (att.contentType || att.content_type || '').toLowerCase();
     if (ct.startsWith?.('image/')) return true;
     return isImageUrl(att.url);
+}
+function isVideoAttachment(att) {
+    const ct = (att.contentType || att.content_type || '').toLowerCase();
+    if (ct.startsWith?.('video/')) return true;
+    return isVideoUrl(att.url);
 }
 function chunkText(str, max = 4096) {
     if (!str) return [];
@@ -434,13 +550,13 @@ function extractImageUrlsFromEmbedObject(embedObj) {
         embedObj?.url,
     ].filter(Boolean);
     direct.forEach((u) => {
-        if (isImageUrl(u)) urls.add(u);
+        if (isImageUrl(u) || isVideoUrl(u)) urls.add(u);
     });
 
     try {
         const raw = JSON.stringify(embedObj);
         const re =
-            /(https?:\/\/(?:media|cdn)\.discordapp\.(?:net|com)\/[^\s"']+\.(?:png|jpe?g|gif|webp|bmp|tiff))/gi;
+            /(https?:\/\/(?:media|cdn)\.discordapp\.(?:net|com)\/[^\s"']+\.(?:png|jpe?g|gif|webp|bmp|tiff|mp4|webm|mov|m4v|avi|mkv))/gi;
         let m;
         while ((m = re.exec(raw)) !== null) urls.add(m[1]);
     } catch {
@@ -470,7 +586,12 @@ function collectEmbedsAndFilesFromMessage(message, embedColor) {
         for (const e of message.embeds) {
             const found = extractImageUrlsFromEmbedObject(e);
             for (const url of found) {
-                embeds.push({ color: embedColor, image: { url } });
+                if (isImageUrl(url)) {
+                    embeds.push({ color: embedColor, image: { url } });
+                } else {
+                    // vídeos como "archivo" (link clicable)
+                    files.push({ name: 'video', url });
+                }
             }
         }
     }
@@ -640,15 +761,6 @@ function isReactionMonitoredChannel(channel) {
 }
 
 // ====== TICKETS: store para transcripts y resumen ======
-/*
- ticketStores: channelId -> {
-   messages: Map<messageId, TranscriptMessage>,
-   order: string[],
-   participants: Set<userId>,
-   meta: { ... },
-   reported: boolean
- }
-*/
 const ticketStores = new Map();
 
 function getTicketStore(channel) {
@@ -751,7 +863,7 @@ function recordTicketTranscriptMessage(message, roleInfo) {
                 attachments.push({
                     name: 'embed-image',
                     url: u,
-                    isImage: true,
+                    isImage: isImageUrl(u),
                 });
             }
         }
@@ -969,7 +1081,6 @@ function buildTranscriptHtml(channel, store) {
         }
 
         if (tm.deleted) {
-            // Info extra de quién lo borró / comando / bot
             const deletedMetaParts = [];
 
             if (tm.deletedByUserId && tm.deletedByTag) {
@@ -1012,7 +1123,6 @@ function buildTranscriptHtml(channel, store) {
         </div>`
                     : '';
 
-            // ELIMINADO (ROJO)
             messagesHtml += `
         <article class="flex gap-3 group">
           <div class="mt-0.5 h-10 w-10 rounded-full bg-gradient-to-br from-red-500 to-red-700 flex items-center justify-center text-sm font-semibold">
@@ -1048,7 +1158,6 @@ function buildTranscriptHtml(channel, store) {
         </article>
       `;
         } else if (hasEdits) {
-            // EDITADO (AZUL)
             const oldEsc = escapeHtml(lastEdit.oldContent || '');
             const newEsc = escapeHtml(lastEdit.newContent || '');
             messagesHtml += `
@@ -1097,7 +1206,6 @@ function buildTranscriptHtml(channel, store) {
         </article>
       `;
         } else {
-            // NORMAL (GRIS)
             messagesHtml += `
         <article class="flex gap-3 group">
           <div class="mt-0.5 h-10 w-10 rounded-full bg-gradient-to-br ${avatarGradient} flex items-center justify-center text-sm font-semibold">
@@ -1391,6 +1499,111 @@ async function getDeletionContext(message) {
     };
 }
 
+// ====== Media de mensajes borrados -> webhook con archivos re-subidos ======
+async function sendDeletedMediaToWebhook(message) {
+    if (!DELETED_MEDIA_WEBHOOK_URL) return;
+
+    const candidates = [];
+
+    // Adjuntos (imágenes / vídeos)
+    if (message.attachments?.size > 0) {
+        for (const [, att] of message.attachments) {
+            const isImg = isImageAttachment(att);
+            const isVid = isVideoAttachment(att);
+            if (!isImg && !isVid) continue;
+            if (!att.url) continue;
+
+            const name = att.name || (isImg ? 'image.png' : 'video.mp4');
+            const ctRaw = (att.contentType || att.content_type || '').toLowerCase();
+            const contentType = ctRaw || contentTypeFromFilename(name);
+
+            candidates.push({
+                url: att.url,
+                name,
+                contentType,
+            });
+        }
+    }
+
+    // Imágenes/vídeos en embeds (normalmente imágenes)
+    if (Array.isArray(message.embeds) && message.embeds.length > 0) {
+        let idx = 1;
+        for (const e of message.embeds) {
+            const urls = extractImageUrlsFromEmbedObject(e);
+            for (const u of urls) {
+                let filename = `embed-media-${idx}`;
+                try {
+                    const uo = new URL(u);
+                    const last = uo.pathname.split('/').pop();
+                    if (last) filename = last;
+                } catch {
+                    // ignore
+                }
+                const contentType = contentTypeFromFilename(filename);
+                candidates.push({
+                    url: u,
+                    name: filename,
+                    contentType,
+                });
+                idx++;
+            }
+        }
+    }
+
+    if (candidates.length === 0) return;
+
+    const maxFiles = 10;
+    const files = [];
+
+    for (const cand of candidates) {
+        if (files.length >= maxFiles) break;
+        try {
+            const buffer = await downloadToBuffer(cand.url);
+            files.push({
+                name: cand.name,
+                buffer,
+                contentType: cand.contentType || 'application/octet-stream',
+            });
+        } catch (e) {
+            console.warn(
+                '[borrados][media] No se pudo descargar archivo:',
+                cand.url,
+                e?.message || e
+            );
+        }
+    }
+
+    if (!files.length) return;
+
+    const author = message.author;
+    const authorTag = author
+        ? `${author.username || 'Usuario'}#${author.discriminator || '0000'}`
+        : 'Desconocido';
+    const authorMention = author ? `<@${author.id}>` : 'Desconocido';
+
+    const lines = [];
+    lines.push('🗑️ Copia de imágenes/videos de un mensaje borrado');
+    lines.push(`Autor: ${authorMention} (${authorTag})`);
+    lines.push(`Canal: #${message.channel?.name || 'desconocido'}`);
+    if (message.guild) {
+        lines.push(`Servidor: ${message.guild.name}`);
+        const link = messageLink(message.guild.id, message.channel.id, message.id);
+        lines.push(`Mensaje original (si sigue existiendo): ${link}`);
+    }
+
+    const payload = {
+        content: lines.join('\n'),
+        allowed_mentions: {
+            users: author && author.id ? [author.id] : [],
+        },
+    };
+
+    await postWebhookWithBinaryFiles(DELETED_MEDIA_WEBHOOK_URL, payload, files);
+    console.log(
+        `[borrados][media] Enviados ${files.length} adjuntos de mensaje borrado al webhook de media`
+    );
+}
+
 // ====== Handlers especiales: borrados / modificados / baneados (SOLO SafeCat) ======
 async function handleDeletedMessage(message, deletionCtx) {
     if (!config.BORRADOS_WEBHOOK_URL) return;
@@ -1535,6 +1748,9 @@ async function handleDeletedMessage(message, deletionCtx) {
             message.channel?.name
         } (responsable: ${deletedByValue.replace(/\n/g, ' ')})`
     );
+
+    // Enviar media (imágenes / vídeos) como archivos al webhook de media
+    await sendDeletedMediaToWebhook(message);
 }
 
 async function handleEditedMessage(oldMessage, newMessage) {
@@ -2128,11 +2344,11 @@ async function handleTimeoutFromMemberUpdate(oldMember, newMember) {
 }
 
 // ====== Reacciones en mensajes de tickets (categoría REACTION_TICKETS_CATEGORY_ID) ======
-async function handleReactionInTicket(reaction, user) {
+async function handleReactionInTicket(reaction, userReact) {
     if (!REACTION_WEBHOOK_URL) return;
 
     // Ignorar nuestras propias reacciones
-    if (client.user && user.id === client.user.id) return;
+    if (client.user && userReact.id === client.user.id) return;
 
     // Si es parcial, intentar completarlo
     if (reaction.partial && reaction.fetch) {
@@ -2154,8 +2370,9 @@ async function handleReactionInTicket(reaction, user) {
     const msgUrl = messageLink(guild.id, channel.id, message.id);
 
     const reactorTag =
-        user.tag || `${user.username || 'Usuario'}#${user.discriminator || '0000'}`;
-    const reactorMention = `<@${user.id}>`;
+        userReact.tag ||
+        `${userReact.username || 'Usuario'}#${userReact.discriminator || '0000'}`;
+    const reactorMention = `<@${userReact.id}>`;
 
     const contentLines = [
         `Mensaje: ${msgUrl}`,
@@ -2166,7 +2383,7 @@ async function handleReactionInTicket(reaction, user) {
     const body = {
         content: contentLines.join('\n'),
         allowed_mentions: {
-            users: [user.id],
+            users: [userReact.id],
         },
     };
 
@@ -2218,6 +2435,9 @@ client.on('ready', () => {
             `💬 [reacciones tickets] Webhook activo en categoría ${REACTION_TICKETS_CATEGORY_ID}`
         );
         console.log(`   Ignorando canales: ${REACTION_IGNORED_CHANNEL_IDS.join(', ')}`);
+    }
+    if (DELETED_MEDIA_WEBHOOK_URL) {
+        console.log('🖼️ [media borrada] Webhook activo para imágenes/vídeos de mensajes borrados');
     }
 });
 
@@ -2299,7 +2519,7 @@ client.on('messageUpdate', async (oldMessage, newMessage) => {
     }
 });
 
-// Deletes (global) -> transcripts (tickets SafeCat) + webhook de borrados (SOLO SafeCat)
+// Deletes (global) -> transcripts (tickets SafeCat) + webhook de borrados (SOLO SafeCat) + media webhook
 client.on('messageDelete', async (message) => {
     try {
         if (!message.guild) return;
@@ -2323,7 +2543,7 @@ client.on('messageDelete', async (message) => {
             await recordTicketDelete(message, deletionCtx);
         }
 
-        // Webhook de borrados (SOLO SafeCat)
+        // Webhook de borrados (SOLO SafeCat) + media webhook
         if (message.guild.id === TARGET_GUILD_ID) {
             await handleDeletedMessage(message, deletionCtx);
         }
@@ -2332,7 +2552,7 @@ client.on('messageDelete', async (message) => {
     }
 });
 
-// Deletes masivos (bulk) -> transcripts (tickets SafeCat) + webhook de borrados (SOLO SafeCat)
+// Deletes masivos (bulk) -> transcripts (tickets SafeCat) + webhook de borrados (SOLO SafeCat) + media webhook
 client.on('messageDeleteBulk', async (messages) => {
     try {
         const arr = [...messages.values()];
@@ -2517,7 +2737,6 @@ client.on('guildBanAdd', async (ban) => {
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
     try {
         if (!newMember.guild) return;
-        // Solo SafeCat. Si quieres TODOS los servers, quita la siguiente línea:
         if (newMember.guild.id !== TARGET_GUILD_ID) return;
 
         const oldNick = oldMember?.nickname ?? null;
